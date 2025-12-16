@@ -1,0 +1,113 @@
+services:
+  # =============================================================================
+  # OpenSearch（向量库 / 混合检索）
+  # =============================================================================
+  opensearch-node:
+    image: opensearchproject/opensearch:3
+    container_name: opensearch
+    environment:
+      - discovery.type=single-node
+      - DISABLE_SECURITY_PLUGIN=true # 开发环境建议关闭安全插件
+      - OPENSEARCH_JAVA_OPTS=-Xms2g -Xmx2g
+      - bootstrap.memory_lock=true
+      - thread_pool.write.size=8
+      - thread_pool.write.queue_size=1000
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - ./opensearch_data:/usr/share/opensearch/data
+    ports:
+      - "127.0.0.1:9200:9200"
+      - "127.0.0.1:9600:9600"
+    networks:
+      - opensearch-dev-net
+
+  # =============================================================================
+  # OpenSearch Dashboards（可视化）
+  # =============================================================================
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:3
+    container_name: opensearch-dashboards
+    ports:
+      - "127.0.0.1:5601:5601"
+    environment:
+      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
+      - OPENSEARCH_HOSTS=http://opensearch-node:9200
+    depends_on:
+      - opensearch-node
+    networks:
+      - opensearch-dev-net
+
+  # =============================================================================
+  # Redis（query embedding 缓存等）
+  # =============================================================================
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - opensearch-dev-net
+
+  # =============================================================================
+  # Neo4j（知识图谱）
+  # =============================================================================
+  neo4j:
+    image: neo4j:5.26.18
+    container_name: neo4j
+    environment:
+      NEO4J_AUTH: "${NEO4J_USERNAME:-neo4j}/${NEO4J_PASSWORD:-password}"
+      NEO4JLABS_PLUGINS: '["apoc","graph-data-science"]'
+      NEO4J_apoc_export_file_enabled: "true"
+      NEO4J_apoc_import_file_enabled: "true"
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*,gds.*"
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - ./neo4j_home/data:/data
+      - ./neo4j_home/logs:/logs
+      - ./neo4j_home/plugins:/plugins
+      - ./neo4j_home/import:/import
+    restart: unless-stopped
+    networks:
+      - opensearch-dev-net
+
+  # =============================================================================
+  # TEI Reranker（重排 / GPU 推理）
+  # =============================================================================
+  tei-reranker:
+    image: ghcr.io/huggingface/text-embeddings-inference:89-1.8
+    container_name: tei-rerank
+    ports:
+      - "8082:80"
+    volumes:
+      - ./models/ReRank:/ReRank
+    environment:
+      - USE_FLASH_ATTENTION=false
+      - MAX_CONCURRENT_REQUESTS=1024
+      - MAX_BATCH_REQUESTS=32
+      - NVIDIA_VISIBLE_DEVICES=0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    command: >
+      --model-id /ReRank/BAAI/bge-reranker-base
+      --port 80
+      --dtype float16
+      --auto-truncate
+    restart: always
+    networks:
+      - opensearch-dev-net
+
+networks:
+  opensearch-dev-net:
+    driver: bridge

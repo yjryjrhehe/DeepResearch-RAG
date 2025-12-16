@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local runtime artifacts
+.env
+uploads/
+models/
+neo4j_home/
+opensearch_data/
+docs/
+notebook.ipynb
