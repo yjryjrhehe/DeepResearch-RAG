@@ -441,7 +441,7 @@ class Neo4jGraphRepository(GraphRepository):
                     kws = [kws]
                 kws = [k for k in kws if str(k).strip()]
                 desc = (r.get("description") or "").strip()
-                weight = float(r.get("weight") or 0.0)
+                weight = float(r.get("weight") or 0.0) # weight是同样的关系出现次数，越多则说明越重要
                 if existing is None:
                     relations_map[key] = {
                         "source": src,
