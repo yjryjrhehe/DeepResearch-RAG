@@ -11,9 +11,12 @@ from __future__ import annotations
 import re
 import logging
 from typing import List, Tuple, Any
+import hashlib
+import json
 
 import json_repair
 from langchain_core.language_models import BaseChatModel
+from redis.asyncio import Redis
 
 from ...core.prompts import (
     DEFAULT_COMPLETION_DELIMITER,
@@ -146,13 +149,53 @@ def _parse_tuple_delimited_extraction(
 class LLMKeywordExtractor(KeywordExtractor):
     """使用 LLM 从查询中抽取图谱检索关键词。"""
 
-    def __init__(self, llm: BaseChatModel):
+    def __init__(
+        self,
+        llm: BaseChatModel,
+        *,
+        redis: Redis | None = None,
+        cache_ttl_seconds: int = 0,
+        model_name: str = "",
+    ):
         self._llm = llm
+        self._redis = redis
+        self._cache_ttl_seconds = cache_ttl_seconds
+        self._model_name = model_name
+
+    def _make_cache_key(self, query: str) -> str:
+        digest = hashlib.sha256((query or "").strip().encode("utf-8")).hexdigest()
+        return f"kgkw:{self._model_name}:{digest}"
 
     async def extract(self, query: str) -> Tuple[List[str], List[str]]:
         """
         关键词抽取，异常时返回空结果而不阻断流程。
         """
+        # 先从缓存中查找是否存在已经对该query提取过关键词
+        if self._redis and self._cache_ttl_seconds > 0 and query.strip():
+            try:
+                cache_key = self._make_cache_key(query)
+                cached = await self._redis.get(cache_key)
+                if cached:
+                    if isinstance(cached, (bytes, bytearray)):
+                        cached = cached.decode("utf-8")
+                    data = json.loads(cached)
+                    if isinstance(data, dict):
+                        high = data.get("high", [])
+                        low = data.get("low", [])
+                        high = [
+                            _normalize_name(str(x))
+                            for x in high
+                            if _normalize_name(str(x))
+                        ]
+                        low = [
+                            _normalize_name(str(x))
+                            for x in low
+                            if _normalize_name(str(x))
+                        ]
+                        return high, low
+            except Exception:
+                pass
+
         prompt = KG_KEYWORDS_PROMPT.format(query=query)
         try:
             result = await self._llm.ainvoke(prompt)
@@ -166,6 +209,18 @@ class LLMKeywordExtractor(KeywordExtractor):
 
         high = [_normalize_name(str(x)) for x in (high or []) if _normalize_name(str(x))]
         low = [_normalize_name(str(x)) for x in (low or []) if _normalize_name(str(x))]
+
+        if self._redis and self._cache_ttl_seconds > 0 and query and query.strip():
+            try:
+                cache_key = self._make_cache_key(query)
+                payload = json.dumps(
+                    {"high": high, "low": low},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                await self._redis.set(name=cache_key, value=payload, ex=self._cache_ttl_seconds)
+            except Exception:
+                pass
         return high, low
 
 

@@ -6,6 +6,7 @@ from functools import lru_cache
 
 from ...core.config import settings
 from ..llm.factory import get_research_llm
+from ..cache.factory import get_redis_client
 from .llm_extractors import LLMGraphExtractor, LLMKeywordExtractor
 from .neo4j_graph import Neo4jGraphRepository
 
@@ -30,5 +31,10 @@ def get_graph_extractor() -> LLMGraphExtractor:
 @lru_cache()
 def get_keyword_extractor() -> LLMKeywordExtractor:
     """获取 LLM 关键词抽取器单例。"""
-    return LLMKeywordExtractor(llm=get_research_llm())
-
+    redis_client = get_redis_client() if settings.redis.enabled else None
+    return LLMKeywordExtractor(
+        llm=get_research_llm(),
+        redis=redis_client,
+        cache_ttl_seconds=settings.redis.embedding_ttl_seconds,
+        model_name=settings.research_llm.model,
+    )

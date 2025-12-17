@@ -103,7 +103,14 @@ class IngestionService(Ingestor):
                 async with kg_semaphore:
                     try:
                         entities, relations = await self.graph_extractor.extract(enriched_chunk)
-                        await self.graph_repo.upsert_chunk_knowledge(enriched_chunk, entities, relations)
+                        results = await asyncio.gather(
+                            self.graph_repo.upsert_chunk_knowledge(enriched_chunk, entities, relations),
+                            self.store.index_graph_entities_relations(enriched_chunk, entities, relations),
+                            return_exceptions=True,
+                        )
+                        for r in results:
+                            if isinstance(r, Exception):
+                                raise r
                     except Exception as exc:
                         log.error(
                             "知识图谱增量更新失败 (chunk_id=%s): %s",

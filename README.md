@@ -40,6 +40,21 @@
 7. 删除原项目库中任何你觉得不需要的代码或文件或文件夹。
 8. 给出具体部署方案和配置说明。
 
+
+
+------
+
+# 修改：
+
+1. 通过llm抽取的文本块中的关系和实体应该分别在opensearch中建立索引。
+   1. 对于关系：抽取出之后将其内容拼接为：“source_entity、target_entity、relationship_keywords、relationship_description” 格式存入opensearch。
+   2. 对于实体：抽取出之后将其拼接为：“entity_name、entity_type、entity_description”格式存入opensearch。
+   3. 同时也需要将实体和关系按照原先的方式存入neo4j
+2. 在检索阶段，对于实体和关系的检索修改为先从opensearch中的实体、关系向量数据库分别检索解析出实体和关系（entity、source_entity、target_entity），再根据这些结果到neo4j中检索实际的实体、关系及其对应的chunk_id，通过neo4j进行节点度（degree）排序，筛选出top_k的实体和关系，从命中的实体出发取相连边/邻居节点，最后将结果拼接为结构化Context，并附上与实体相关的chunks。
+3. 在缓存阶段，除了将query改写后的查询和Embedding向量进行缓存，还需要对以下内容进行缓存:
+   1. 向量查询过程中产生的query和其改写结果缓存；
+   2. 对query进行low/high level内容抽取结果。
+
 ---
 
 # 当前实现进度（已落地）

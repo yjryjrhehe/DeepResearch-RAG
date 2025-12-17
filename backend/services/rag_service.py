@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import logging
 import asyncio
+import hashlib
+import json
 from collections import Counter
-from typing import List, Dict, Tuple, Any
+from typing import List, Dict, Tuple, Any, Optional
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate
@@ -34,6 +36,8 @@ from ..domain.models import (
     AnswerReference,
     RetrievalMode,
 )
+from redis.asyncio import Redis
+from ..infrastructure.cache.redis_embedding_cache import build_embedding_cache_key
 
 log = logging.getLogger(__name__)
 
@@ -86,13 +90,20 @@ def _build_context(
     lines.append("[Knowledge Graph Data]")
     entities = graph_context.get("entities") or []
     relations = graph_context.get("relations") or []
+    entity_to_chunk_ids = graph_context.get("entity_to_chunk_ids") or {}
     if entities:
         lines.append("- Entities:")
         for e in entities[: settings.kg.query_top_k_entities]:
             name = e.get("name", "")
             etype = e.get("type", "Other")
             desc = (e.get("description") or "").strip()
-            lines.append(f"  - {name} ({etype}): {desc}")
+            degree = e.get("degree")
+            degree_str = f" | degree: {degree}" if isinstance(degree, (int, float)) else ""
+            lines.append(f"  - {name} ({etype}){degree_str}: {desc}")
+            if isinstance(entity_to_chunk_ids, dict):
+                cids = entity_to_chunk_ids.get(name) or []
+                if cids:
+                    lines.append(f"    - chunks: {', '.join([str(c) for c in cids if str(c).strip()])}")
     else:
         lines.append("- Entities: (无)")
 
@@ -146,12 +157,18 @@ class RagService(RAGOrchestrator):
         rewrite_llm: BaseChatModel,
         answer_llm: BaseChatModel,
         reranker: Reranker,
+        redis: Redis | None = None,
+        cache_ttl_seconds: int = 0,
+        rewrite_model_name: str = "",
     ):
         self._search_repo = search_repo
         self._graph_repo = graph_repo
         self._keyword_extractor = keyword_extractor
         self._reranker = reranker
         self._answer_llm = answer_llm
+        self._redis = redis
+        self._cache_ttl_seconds = max(0, int(cache_ttl_seconds or 0))
+        self._rewrite_model_name = (rewrite_model_name or "").strip() or "rewrite"
 
         self._rewrite_chain = (
             ChatPromptTemplate.from_template(QUERY_REWRITE_PROMPT)
@@ -159,19 +176,136 @@ class RagService(RAGOrchestrator):
             | StrOutputParser()
         )
 
+    def _make_cache_key(self, prefix: str, query: str) -> str:
+        digest = hashlib.sha256((query or "").strip().encode("utf-8")).hexdigest()
+        return f"{prefix}:{self._rewrite_model_name}:{digest}"
+
+    async def _get_cached_rewrites(self, query: str) -> Optional[List[str]]:
+        """
+        仅从 Redis 读取 query 改写缓存；未命中返回 None。
+
+        用于 `_vector_retrieve` 显式走“Redis 优先”路径。
+        """
+        if not (self._redis and self._cache_ttl_seconds > 0 and query and query.strip()):
+            return None
+        try:
+            cache_key = self._make_cache_key("qrew", query)
+            cached = await self._redis.get(cache_key)
+            if not cached:
+                return None
+            if isinstance(cached, (bytes, bytearray)):
+                cached = cached.decode("utf-8")
+            data = json.loads(cached)
+            if isinstance(data, dict) and isinstance(data.get("rewrites"), list):
+                rewrites = [str(x).strip() for x in data["rewrites"] if str(x).strip()]
+                return rewrites
+        except Exception:
+            return None
+        return None
+
     async def _rewrite_query(self, query: str) -> List[str]:
         """生成查询变体（失败则返回空列表）。"""
+        if self._redis and self._cache_ttl_seconds > 0 and query and query.strip():
+            try:
+                cache_key = self._make_cache_key("qrew", query)
+                cached = await self._redis.get(cache_key)
+                if cached:
+                    if isinstance(cached, (bytes, bytearray)):
+                        cached = cached.decode("utf-8")
+                    data = json.loads(cached)
+                    if isinstance(data, dict) and isinstance(data.get("rewrites"), list):
+                        return [str(x).strip() for x in data["rewrites"] if str(x).strip()]
+            except Exception:
+                pass
         try:
             result = await self._rewrite_chain.ainvoke({"question": query})
-            return [line.strip() for line in str(result).split("\n") if line.strip()]
+            rewrites = [line.strip() for line in str(result).split("\n") if line.strip()]
+            if self._redis and self._cache_ttl_seconds > 0 and query and query.strip():
+                try:
+                    cache_key = self._make_cache_key("qrew", query)
+                    payload = json.dumps(
+                        {"query": query, "rewrites": rewrites},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    await self._redis.set(name=cache_key, value=payload, ex=self._cache_ttl_seconds)
+                except Exception:
+                    pass
+            return rewrites
         except Exception as e:
             log.warning(f"查询改写失败，降级为仅使用原始查询: {e}")
             return []
 
     async def _vector_retrieve(self, query: str) -> List[RetrievedChunk]:
-        queries = [query]
-        queries.extend(await self._rewrite_query(query))
-        results = await self._search_repo.hybrid_search_batch(queries=queries, k=10, rrf_k=60)
+        if not query or not query.strip():
+            return []
+
+        # 1) Redis 优先：尝试读取 query 改写结果
+        rewrites = await self._get_cached_rewrites(query)
+        if rewrites is None:
+            rewrites = await self._rewrite_query(query)
+
+        queries = [query, *rewrites]
+
+        # 2) Redis 优先：尝试读取改写结果对应的 embedding；未命中则补齐向量化
+        embeddings: List[Optional[List[float]]] = [None for _ in queries]
+        if self._redis and self._cache_ttl_seconds > 0:
+            try:
+                keys = [
+                    build_embedding_cache_key(model=settings.embedding_llm.model, text=q)
+                    for q in queries
+                ]
+                cached_values = await self._redis.mget(keys)
+                for i, value in enumerate(cached_values or []):
+                    if not value:
+                        continue
+                    try:
+                        if isinstance(value, (bytes, bytearray)):
+                            value = value.decode("utf-8")
+                        data = json.loads(value)
+                        if isinstance(data, list) and data:
+                            embeddings[i] = [float(x) for x in data]
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        missing_indices = [i for i, emb in enumerate(embeddings) if emb is None]
+        if missing_indices:
+            tasks = [self._search_repo.get_query_embedding(queries[i]) for i in missing_indices]
+            computed = await asyncio.gather(*tasks, return_exceptions=True)
+            for idx, res in zip(missing_indices, computed):
+                if isinstance(res, Exception) or res is None:
+                    continue
+                embeddings[idx] = res
+
+        # 3) 记录向量检索的 query/改写结果（用于调试/审计）
+        if self._redis and self._cache_ttl_seconds > 0 and query.strip():
+            try:
+                cache_key = self._make_cache_key("vecq", query)
+                payload = json.dumps(
+                    {"query": query, "vector_queries": queries},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                await self._redis.set(name=cache_key, value=payload, ex=self._cache_ttl_seconds)
+            except Exception:
+                pass
+
+        # 4) 使用预取到的 embedding 执行批量混合检索（避免重复向量化）
+        filtered_queries: List[str] = []
+        filtered_embeddings: List[List[float]] = []
+        for q, emb in zip(queries, embeddings):
+            if q and q.strip() and emb:
+                filtered_queries.append(q)
+                filtered_embeddings.append(emb)
+
+        if not filtered_queries:
+            return []
+
+        results = await self._search_repo.hybrid_search_batch_with_embeddings(
+            queries=filtered_queries, embeddings=filtered_embeddings, k=10, rrf_k=60
+        )
         flat = [c for sub in results for c in sub]
         return _deduplicate_by_chunk_id(flat)
 
@@ -190,12 +324,33 @@ class RagService(RAGOrchestrator):
             keywords.extend(high)
         graph_query = " ".join(keywords).strip() or query
 
+        # 1) 先从 OpenSearch 的实体/关系向量索引分别检索候选
+        entity_task = self._search_repo.vector_search_entities(graph_query, k=30)
+        relation_task = self._search_repo.vector_search_relations(graph_query, k=30)
+        entity_results, relation_results = await asyncio.gather(entity_task, relation_task)
+
+        entity_candidates: List[str] = []
+        for r in entity_results or []:
+            name = (r.get("entity_name") or "").strip()
+            if name:
+                entity_candidates.append(name)
+
+        relation_candidates: List[tuple[str, str]] = []
+        for r in relation_results or []:
+            src = (r.get("source_entity") or "").strip()
+            tgt = (r.get("target_entity") or "").strip()
+            if src and tgt and src != tgt:
+                relation_candidates.append((src, tgt))
+
+        # 2) 再回查 Neo4j：按节点度排序筛选实体/关系，并从命中实体扩展邻居
         graph_context = await self._graph_repo.query_context(
-            graph_query,
+            entity_candidates,
+            relation_candidates,
             top_k_entities=settings.kg.query_top_k_entities,
+            top_k_relations=settings.kg.query_top_k_entities,
             top_k_chunks=settings.kg.query_top_k_chunks,
         )
-        chunk_ids = graph_context.get("chunk_ids") or []
+        chunk_ids = graph_context.get("chunk_ids", [])
         if not chunk_ids:
             return graph_context, []
 
@@ -204,12 +359,12 @@ class RagService(RAGOrchestrator):
         for doc in docs:
             try:
                 chunk = DocumentChunk(
-                    chunk_id=doc.get("chunk_id"),
-                    document_id=doc.get("document_id"),
+                    chunk_id=doc.get("chunk_id", ""),
+                    document_id=doc.get("document_id", ""),
                     document_name=doc.get("document_name", ""),
                     content=doc.get("content", ""),
-                    summary=doc.get("summary"),
-                    metadata=doc.get("metadata", {}) or {},
+                    summary=doc.get("summary", ""),
+                    metadata=doc.get("metadata", {}),
                 )
                 retrieved.append(RetrievedChunk(chunk=chunk, search_score=0.01, rerank_score=None))
             except Exception:

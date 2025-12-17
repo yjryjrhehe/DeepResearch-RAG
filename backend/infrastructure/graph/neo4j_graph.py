@@ -193,81 +193,366 @@ class Neo4jGraphRepository(GraphRepository):
 
     async def query_context(
         self,
-        query: str,
+        entity_candidates: List[str],
+        relation_candidates: List[tuple[str, str]],
         top_k_entities: int = 10,
+        top_k_relations: int = 10,
         top_k_chunks: int = 20,
     ) -> Dict[str, Any]:
         """
         返回图谱上下文：实体、关系、以及关联 chunk_id。
+
+        检索策略（面向 OpenSearch 候选回查）：
+        1) 对候选实体在 Neo4j 中计算节点度（degree），按度排序筛选 Top-K 实体；
+        2) 对候选关系按端点度之和排序筛选 Top-K 关系；
+        3) 从命中实体出发扩展一跳邻居与关联边；
+        4) 汇总与命中实体相关的 chunk_id，并返回结构化上下文。
         """
         await self._ensure_initialized()
 
-        # 1) 取 Top 实体
-        cypher_entities = """
-        CALL db.index.fulltext.queryNodes('entity_fulltext', $q) YIELD node, score
-        RETURN node { .name, .type, .description } AS entity, score
-        ORDER BY score DESC
-        LIMIT $top_k_entities
+        def _dedupe_keep_order(values: List[str]) -> List[str]:
+            seen: set[str] = set()
+            out: List[str] = []
+            for v in values:
+                if v in seen:
+                    continue
+                seen.add(v)
+                out.append(v)
+            return out
+
+        # --- 0) 清洗候选，合并所有实体 和 关系的两端节点，去重 ---
+        cleaned_entities = [
+            (name or "").strip() for name in (entity_candidates or []) if (name or "").strip()
+        ]
+
+        rel_pairs: List[tuple[str, str]] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        for pair in relation_candidates or []:
+            if not pair or len(pair) != 2:
+                continue
+            src = (pair[0] or "").strip()
+            tgt = (pair[1] or "").strip()
+            if not src or not tgt or src == tgt:
+                continue
+            key = tuple(sorted([src, tgt]))
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+            rel_pairs.append(key)
+
+        candidate_names = _dedupe_keep_order(
+            cleaned_entities + [s for s, _ in rel_pairs] + [t for _, t in rel_pairs]
+        )
+        if not candidate_names:
+            return {
+                "entities": [],
+                "relations": [],
+                "chunk_ids": [],
+                "entity_to_chunk_ids": {},
+                "relation_to_chunk_ids": [],
+            }
+
+        # --- 1) 回查实体属性与 degree 形成 节点：degree 字典，用于后续对实体和关系排序---
+        cypher_entity_degrees = """
+        MATCH (e:Entity)
+        WHERE e.name IN $names
+        RETURN
+            e.name AS name,
+            e.type AS type,
+            e.description AS description,
+            COUNT { (e)-[:RELATED]-() } AS degree
         """
         async with self._driver.session(database=self._database) as session:
-            result = await session.run(
-                cypher_entities, q=query, top_k_entities=top_k_entities
-            )
+            result = await session.run(cypher_entity_degrees, names=candidate_names)
             rows = await result.data()
 
-        entities = [r["entity"] for r in rows if r.get("entity") and r["entity"].get("name")]
-        entity_names = [e["name"] for e in entities]
-        if not entity_names:
-            return {"entities": [], "relations": [], "chunk_ids": []}
+        entity_map: Dict[str, Dict[str, Any]] = {}
+        degree_map: Dict[str, int] = {}
+        for r in rows:
+            name = r.get("name")
+            if not name:
+                continue
+            degree = int(r.get("degree") or 0)
+            degree_map[name] = degree
+            entity_map[name] = {
+                "name": name,
+                "type": r.get("type") or "Other",
+                "description": (r.get("description") or "").strip(),
+                "degree": degree,
+            }
 
-        # 2) 聚合 chunk_id（按出现频次排序）
-        cypher_chunks = """
-        MATCH (c:Chunk)-[:MENTIONS]->(e:Entity)
-        WHERE e.name IN $names
-        RETURN c.chunk_id AS chunk_id, count(*) AS cnt
-        ORDER BY cnt DESC
-        LIMIT $top_k_chunks
+        if not entity_map:
+            return {
+                "entities": [],
+                "relations": [],
+                "chunk_ids": [],
+                "entity_to_chunk_ids": {},
+                "relation_to_chunk_ids": [],
+            }
+
+        safe_top_k_entities = max(0, int(top_k_entities or 0))
+        safe_top_k_relations = max(0, int(top_k_relations or 0))
+        safe_top_k_chunks = max(0, int(top_k_chunks or 0))
+
+        # --- 2) Top-K 实体（按 degree 排序） ---
+        sorted_entities = sorted(
+            entity_map.values(),
+            key=lambda e: (e.get("degree", 0), e.get("name", "")),
+            reverse=True,
+        )
+        top_entities = sorted_entities[:safe_top_k_entities] if safe_top_k_entities else []
+        top_entity_names = [e["name"] for e in top_entities if e.get("name")]
+
+        # --- 3) Top-K 关系（按端点 degree 之和排序） ---
+        scored_rel_pairs: List[tuple[str, str, int]] = []
+        for src, tgt in rel_pairs:
+            if src not in degree_map or tgt not in degree_map:
+                continue
+            scored_rel_pairs.append((src, tgt, degree_map.get(src, 0) + degree_map.get(tgt, 0)))
+        scored_rel_pairs.sort(key=lambda x: (x[2], x[0], x[1]), reverse=True)
+        top_rel_pairs = [(s, t) for s, t, _ in scored_rel_pairs[:safe_top_k_relations]]
+        
+        # 把实体 和 关系两端节点 合并 
+        seed_names = _dedupe_keep_order(
+            top_entity_names + [s for s, _ in top_rel_pairs] + [t for _, t in top_rel_pairs]
+        )
+        if not seed_names:
+            return {
+                "entities": [],
+                "relations": [],
+                "chunk_ids": [],
+                "entity_to_chunk_ids": {},
+                "relation_to_chunk_ids": [],
+            }
+
+        # --- 4) 从命中实体扩展邻居（限制每个 seed 的邻居数量） ---
+        neighbor_limit_per_entity = max(1, safe_top_k_relations or safe_top_k_entities or 10)
+        cypher_expand_neighbors = """
+        UNWIND $seed_names AS name
+        MATCH (e:Entity {name: name})
+        CALL {
+            WITH e
+            MATCH (e)-[r:RELATED]-(n:Entity)
+            RETURN n, r
+            ORDER BY coalesce(r.weight, 0.0) DESC
+            LIMIT $neighbor_limit
+        }
+        RETURN
+            e.name AS source,
+            n.name AS target,
+            n.type AS target_type,
+            n.description AS target_description,
+            r.keywords AS keywords,
+            r.description AS description,
+            r.weight AS weight
         """
         async with self._driver.session(database=self._database) as session:
             result = await session.run(
-                cypher_chunks, names=entity_names, top_k_chunks=top_k_chunks
+                cypher_expand_neighbors,
+                seed_names=seed_names,
+                neighbor_limit=neighbor_limit_per_entity,
             )
-            chunk_rows = await result.data()
-        chunk_ids = [r["chunk_id"] for r in chunk_rows if r.get("chunk_id")]
+            neighbor_rows = await result.data()
 
-        # 3) 抽取实体间关系（仅保留 entity_names 范围内）
-        cypher_relations = """
-        MATCH (a:Entity)-[r:RELATED]-(b:Entity)
-        WHERE a.name IN $names AND b.name IN $names
-        RETURN a.name AS source, b.name AS target,
-               r.keywords AS keywords, r.description AS description, r.weight AS weight
-        """
-        async with self._driver.session(database=self._database) as session:
-            result = await session.run(cypher_relations, names=entity_names)
-            rel_rows = await result.data()
-
-        seen = set()
-        relations: List[Dict[str, Any]] = []
-        for r in rel_rows:
+        all_names: List[str] = []
+        relations_map: Dict[tuple[str, str], Dict[str, Any]] = {}
+        neighbor_names: set[str] = set()
+        for r in neighbor_rows:
             src = r.get("source")
             tgt = r.get("target")
             if not src or not tgt or src == tgt:
                 continue
+            neighbor_names.add(tgt)
+
             key = tuple(sorted([src, tgt]))
-            if key in seen:
-                continue
-            seen.add(key)
-            relations.append(
-                {
+            existing = relations_map.get(key)
+            kws = r.get("keywords") or []
+            if not isinstance(kws, list):
+                kws = [kws]
+            kws = [k for k in kws if str(k).strip()]
+            desc = (r.get("description") or "").strip()
+            weight = float(r.get("weight") or 0.0)
+            if existing is None:
+                relations_map[key] = {
                     "source": src,
                     "target": tgt,
-                    "keywords": r.get("keywords") or [],
-                    "description": r.get("description") or "",
-                    "weight": r.get("weight") or 0.0,
+                    "keywords": kws,
+                    "description": desc,
+                    "weight": weight,
                 }
-            )
+            else:
+                existing_kws = existing.get("keywords") or []
+                existing["keywords"] = list({*existing_kws, *kws})
+                if not existing.get("description") and desc:
+                    existing["description"] = desc
+                existing["weight"] = max(float(existing.get("weight") or 0.0), weight)
 
-        return {"entities": entities, "relations": relations, "chunk_ids": chunk_ids}
+        all_names = _dedupe_keep_order(seed_names + list(neighbor_names))
+
+        # 补齐邻居节点信息（若未在候选中出现）
+        missing_names = [n for n in all_names if n not in entity_map]
+        if missing_names:
+            async with self._driver.session(database=self._database) as session:
+                result = await session.run(cypher_entity_degrees, names=missing_names)
+                extra_rows = await result.data()
+            for r in extra_rows:
+                name = r.get("name")
+                if not name:
+                    continue
+                degree = int(r.get("degree") or 0)
+                degree_map[name] = degree
+                entity_map[name] = {
+                    "name": name,
+                    "type": r.get("type") or "Other",
+                    "description": (r.get("description") or "").strip(),
+                    "degree": degree,
+                }
+
+        # --- 5) 回查 Top-K 关系的属性（仅保留 Neo4j 中真实存在的边） ---
+        # top_rel_pairs 来自 OpenSearch 关系向量检索的候选对 (source,target)，但候选不一定都成功落到 Neo4j（或被去重/规范化后不存在）
+        # 为什么不在第一步直接筛选掉不存在的关系：因为opensearch检索到的结果可能存在真实有效但是未被写入graph的关系，
+        # 我们希望这类结果也被利用起来去检索单跳邻居节点，获得更多有用信息。
+        if top_rel_pairs:
+            cypher_top_relations = """
+            UNWIND $pairs AS p
+            MATCH (a:Entity {name: p.source})-[r:RELATED]-(b:Entity {name: p.target})
+            RETURN
+                a.name AS source,
+                b.name AS target,
+                r.keywords AS keywords,
+                r.description AS description,
+                r.weight AS weight
+            """
+            pairs_payload = [{"source": s, "target": t} for s, t in top_rel_pairs]
+            async with self._driver.session(database=self._database) as session:
+                result = await session.run(cypher_top_relations, pairs=pairs_payload)
+                rel_rows = await result.data()
+
+            for r in rel_rows:
+                src = r.get("source")
+                tgt = r.get("target")
+                if not src or not tgt or src == tgt:
+                    continue
+                # 把关系当“无向边”去重
+                key = tuple(sorted([src, tgt]))
+                existing = relations_map.get(key)
+                kws = r.get("keywords") or []
+                if not isinstance(kws, list):
+                    kws = [kws]
+                kws = [k for k in kws if str(k).strip()]
+                desc = (r.get("description") or "").strip()
+                weight = float(r.get("weight") or 0.0)
+                if existing is None:
+                    relations_map[key] = {
+                        "source": src,
+                        "target": tgt,
+                        "keywords": kws,
+                        "description": desc,
+                        "weight": weight,
+                    }
+                else:
+                    existing_kws = existing.get("keywords") or []
+                    existing["keywords"] = list({*existing_kws, *kws})
+                    if not existing.get("description") and desc:
+                        existing["description"] = desc
+                    existing["weight"] = max(float(existing.get("weight") or 0.0), weight)
+
+        # --- 6) 关系按 degree_score 排序并截断 ---
+        # 把 relations_map 里的候选边做最终筛选
+        relations: List[Dict[str, Any]] = []
+        for rel in relations_map.values():
+            src = rel.get("source")
+            tgt = rel.get("target")
+            degree_score = int(degree_map.get(src, 0) + degree_map.get(tgt, 0))
+            rel["degree_score"] = degree_score
+            relations.append(rel)
+
+        relations.sort(
+            key=lambda r: (r.get("degree_score", 0), float(r.get("weight") or 0.0)),
+            reverse=True,
+        )
+        if safe_top_k_relations:
+            relations = relations[:safe_top_k_relations]
+
+        # --- 7) 关联 chunk_id（基于 seed 实体聚合） ---
+        entity_to_chunk_ids: Dict[str, List[str]] = {}
+        chunks_per_entity = 3
+        cypher_entity_chunks = """
+        UNWIND $seed_names AS name
+        MATCH (e:Entity {name: name})
+        OPTIONAL MATCH (c:Chunk)-[:MENTIONS]->(e)
+        RETURN name AS entity_name, collect(DISTINCT c.chunk_id)[0..$limit] AS chunk_ids
+        """
+        async with self._driver.session(database=self._database) as session:
+            result = await session.run(
+                cypher_entity_chunks, seed_names=seed_names, limit=chunks_per_entity
+            )
+            chunk_rows = await result.data()
+        for r in chunk_rows:
+            name = r.get("entity_name")
+            chunk_list = [c for c in (r.get("chunk_ids") or []) if c]
+            if name:
+                entity_to_chunk_ids[name] = chunk_list
+
+        chunk_ids: List[str] = []
+        if safe_top_k_chunks:
+            cypher_chunks = """
+            MATCH (c:Chunk)-[:MENTIONS]->(e:Entity)
+            WHERE e.name IN $names
+            RETURN c.chunk_id AS chunk_id, count(*) AS cnt
+            ORDER BY cnt DESC
+            LIMIT $top_k_chunks
+            """
+            async with self._driver.session(database=self._database) as session:
+                result = await session.run(
+                    cypher_chunks, names=seed_names, top_k_chunks=safe_top_k_chunks
+                )
+                chunk_rows = await result.data()
+            chunk_ids = [r["chunk_id"] for r in chunk_rows if r.get("chunk_id")]
+
+        # --- 8) （可选）关系相关 chunk_id：同时提及两端实体的 chunk ---
+        relation_to_chunk_ids: List[Dict[str, Any]] = []
+        if relations:
+            pairs_payload = [
+                {"source": r.get("source"), "target": r.get("target")}
+                for r in relations
+                if r.get("source") and r.get("target")
+            ]
+            cypher_relation_chunks = """
+            UNWIND $pairs AS p
+            MATCH (a:Entity {name: p.source})
+            MATCH (b:Entity {name: p.target})
+            MATCH (c:Chunk)-[:MENTIONS]->(a)
+            MATCH (c)-[:MENTIONS]->(b)
+            RETURN p.source AS source, p.target AS target, collect(DISTINCT c.chunk_id)[0..$limit] AS chunk_ids
+            """
+            async with self._driver.session(database=self._database) as session:
+                result = await session.run(
+                    cypher_relation_chunks, pairs=pairs_payload, limit=3
+                )
+                rel_chunk_rows = await result.data()
+            for r in rel_chunk_rows:
+                src = r.get("source")
+                tgt = r.get("target")
+                cids = [c for c in (r.get("chunk_ids") or []) if c]
+                if src and tgt:
+                    relation_to_chunk_ids.append({"source": src, "target": tgt, "chunk_ids": cids})
+
+        # --- 9) 输出实体列表（度排序；包含 seed + 邻居） ---
+        entities_out = [entity_map[n] for n in all_names if n in entity_map]
+        entities_out.sort(
+            key=lambda e: (e.get("degree", 0), e.get("name", "")),
+            reverse=True,
+        )
+
+        return {
+            "entities": entities_out,
+            "relations": relations,
+            "chunk_ids": chunk_ids,
+            "entity_to_chunk_ids": entity_to_chunk_ids,
+            "relation_to_chunk_ids": relation_to_chunk_ids,
+            "seed_entities": seed_names,
+        }
 
     async def get_entity_subgraph(self, entity_name: str, depth: int = 1) -> Dict[str, Any]:
         await self._ensure_initialized()

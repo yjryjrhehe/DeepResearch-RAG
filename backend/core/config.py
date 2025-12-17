@@ -139,6 +139,8 @@ class OpenSearchSettings(BaseConfigSettings):
     model_config = SettingsConfigDict(env_prefix="OPENSEARCH_")
     
     index_name: str = "rag_system_chunks_async"
+    entity_index_name: str = "rag_system_entities_async"
+    relation_index_name: str = "rag_system_relations_async"
     host: str = 'localhost'
     port: int = 9200
     auth: str = Field(default='admin:admin', validation_alias="AUTH")

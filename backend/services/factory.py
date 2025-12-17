@@ -13,6 +13,7 @@ from ..infrastructure.parse.factory import (
 )
 from ..infrastructure.repository.factory import get_opensearch_store
 from ..infrastructure.llm.factory import get_rewrite_llm, get_answer_llm, get_reranker
+from ..infrastructure.cache.factory import get_redis_client
 from ..infrastructure.graph.factory import (
     get_graph_extractor,
     get_graph_repository,
@@ -67,4 +68,7 @@ def get_rag_service() -> RAGOrchestrator:
         rewrite_llm=get_rewrite_llm(),
         answer_llm=get_answer_llm(),
         reranker=get_reranker(),
+        redis=get_redis_client() if settings.redis.enabled else None,
+        cache_ttl_seconds=settings.redis.embedding_ttl_seconds,
+        rewrite_model_name=settings.rewrite_llm.model,
     )

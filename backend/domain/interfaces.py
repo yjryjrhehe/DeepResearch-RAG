@@ -112,8 +112,50 @@ class SearchRepository(ABC):
         pass
 
     @abstractmethod
+    async def get_query_embedding(self, text: str) -> Optional[List[float]]:
+        """获取 query embedding（实现可选择使用缓存）。"""
+        pass
+
+    @abstractmethod
+    async def hybrid_search_batch_with_embeddings(
+        self,
+        queries: List[str],
+        embeddings: List[List[float]],
+        k: int = 5,
+        rrf_k: int = 60,
+    ) -> List[List[RetrievedChunk]]:
+        """
+        批量执行混合检索（使用外部提供的 query embeddings）。
+
+        说明：
+        - `queries[i]` 对应 `embeddings[i]`；
+        - 该方法不会在内部再次生成 embedding（除非实现方自行兜底）。
+        """
+        pass
+
+    @abstractmethod
     async def mget_documents(self, chunk_ids: List[str]) -> List[dict]:
         """批量获取原始存储文档（保持输入顺序）。"""
+        pass
+
+    @abstractmethod
+    async def index_graph_entities_relations(
+        self,
+        chunk: DocumentChunk,
+        entities: List[GraphEntity],
+        relations: List[GraphRelation],
+    ) -> None:
+        """将从单个 chunk 抽取的实体/关系分别写入 OpenSearch 的独立索引。"""
+        pass
+
+    @abstractmethod
+    async def vector_search_entities(self, query_text: str, k: int = 10) -> List[dict]:
+        """在实体索引中执行向量检索，返回包含 entity_name 等字段的结果列表。"""
+        pass
+
+    @abstractmethod
+    async def vector_search_relations(self, query_text: str, k: int = 10) -> List[dict]:
+        """在关系索引中执行向量检索，返回包含 source_entity/target_entity 等字段的结果列表。"""
         pass
 
 
@@ -167,18 +209,21 @@ class GraphRepository(ABC):
     @abstractmethod
     async def query_context(
         self,
-        query: str,
+        entity_candidates: List[str],
+        relation_candidates: List[tuple[str, str]],
         top_k_entities: int = 10,
+        top_k_relations: int = 10,
         top_k_chunks: int = 20,
     ) -> dict:
         """
-        根据查询返回用于回答的图谱上下文。
+        根据候选实体/关系返回用于回答的图谱上下文。
 
         建议结构：
         {
           "entities": [{"name":..., "type":..., "description":...}],
           "relations": [{"source":..., "target":..., "keywords":..., "description":..., "weight":...}],
-          "chunk_ids": ["..."]
+          "chunk_ids": ["..."],
+          "entity_to_chunk_ids": {"entity_name": ["chunk_id", ...]}
         }
         """
         pass

@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
@@ -6,7 +7,6 @@ from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 import jieba
 
 # --- OpenSearch 异步客户端 ---
-# 3.x 版本未在顶层导出异步客户端与 helper，需要从 _async 子模块导入
 from opensearchpy import TransportError
 from opensearchpy._async.client import AsyncOpenSearch
 from opensearchpy._async.helpers.actions import async_bulk
@@ -17,9 +17,13 @@ from ...core.config import settings
 # 导入日志 (logging)
 from ...core.logging import setup_logging
 from ..llm.factory import get_embedding_model
-from ...domain.models import DocumentChunk, RetrievedChunk
+from ...domain.models import DocumentChunk, RetrievedChunk, GraphEntity, GraphRelation
 from ...domain.interfaces import SearchRepository, EmbeddingCache
-from .mappings import get_opensearch_mapping
+from .mappings import (
+    get_entity_opensearch_mapping,
+    get_opensearch_mapping,
+    get_relation_opensearch_mapping,
+)
 from ..cache.redis_embedding_cache import build_embedding_cache_key
 
 # === 日志配置 ===
@@ -47,12 +51,16 @@ class AsyncOpenSearchRAGStore(SearchRepository):
         """
         # 从 config 模块导入 (使用 settings.opensearch.*)
         self.index_name = settings.opensearch.index_name
+        self.entity_index_name = settings.opensearch.entity_index_name
+        self.relation_index_name = settings.opensearch.relation_index_name
         self.host = settings.opensearch.host
         self.port = settings.opensearch.port
         
         # 使用 logging
         log.info(f"正在初始化 AsyncOpenSearchRAGStore...")
-        log.info(f"目标索引: {self.index_name}")
+        log.info(f"目标索引 (chunks): {self.index_name}")
+        log.info(f"目标索引 (entities): {self.entity_index_name}")
+        log.info(f"目标索引 (relations): {self.relation_index_name}")
         log.info(f"OpenSearch 地址: {self.host}:{self.port}")
         log.info(f"Embedding 维度: {EMBEDDING_DIM}")
 
@@ -130,6 +138,14 @@ class AsyncOpenSearchRAGStore(SearchRepository):
 
         return embedding
 
+    async def get_query_embedding(self, text: str) -> Optional[List[float]]:
+        """
+        获取 query embedding（复用内部缓存逻辑）。
+
+        供 services 层在检索前显式预取/复用 Redis 缓存。
+        """
+        return await self._get_query_embedding_async(text)
+
     async def _get_embeddings_batch_async(self, texts: List[str]) -> List[List[float]]:
         if not texts:
             return []
@@ -196,21 +212,25 @@ class AsyncOpenSearchRAGStore(SearchRepository):
 
     # --- 索引管理 (DDL) ---
 
+    async def _create_index_if_missing(self, index_name: str, mapping_body: Dict[str, Any]) -> None:
+        if await self.client.indices.exists(index=index_name):
+            log.warning(f"索引 '{index_name}' 已存在。")
+            return
+        try:
+            await self.client.indices.create(index=index_name, body=mapping_body)
+            log.info(f"索引 '{index_name}' 创建成功。")
+        except TransportError as e:
+            log.error(f"创建索引 '{index_name}' 时出错: {e.status_code} {e.info}", exc_info=True)
+        except Exception as e:
+            log.error(f"创建索引 '{index_name}' 时发生未知错误: {e}", exc_info=True)
+
     async def create_index(self):
         """
         显式创建索引的方法。应在应用启动时调用。
         """
-        mapping_body = get_opensearch_mapping() # 获取配置
-        if not await self.client.indices.exists(index=self.index_name):
-            try:
-                await self.client.indices.create(index=self.index_name, body=mapping_body)
-                log.info(f"索引 '{self.index_name}' 创建成功。")
-            except TransportError as e:
-                log.error(f"创建索引时出错: {e.status_code} {e.info}", exc_info=True)
-            except Exception as e:
-                log.error(f"创建索引时发生未知错误: {e}", exc_info=True)
-        else:
-            log.warning(f"索引 '{self.index_name}' 已存在。")
+        await self._create_index_if_missing(self.index_name, get_opensearch_mapping())
+        await self._create_index_if_missing(self.entity_index_name, get_entity_opensearch_mapping())
+        await self._create_index_if_missing(self.relation_index_name, get_relation_opensearch_mapping())
 
     # --- 文档读取（供图谱检索回查） ---
 
@@ -235,6 +255,220 @@ class AsyncOpenSearchRAGStore(SearchRepository):
             return [docs_map[cid] for cid in chunk_ids if cid in docs_map]
         except Exception as e:
             log.error(f"mget 批量获取失败: {e}", exc_info=True)
+            return []
+
+    # --- 图谱索引（实体/关系） ---
+
+    def _make_stable_id(self, namespace: str, raw: str) -> str:
+        digest = hashlib.sha256((raw or "").encode("utf-8")).hexdigest()
+        return f"{namespace}:{digest}"
+
+    async def index_graph_entities_relations(
+        self,
+        chunk: DocumentChunk,
+        entities: List[GraphEntity],
+        relations: List[GraphRelation],
+    ) -> None:
+        """
+        将 LLM 从单个 chunk 抽取的实体/关系分别写入 OpenSearch 的独立索引。
+
+        - 实体文本拼接格式：entity_name、entity_type、entity_description
+        - 关系文本拼接格式：source_entity、target_entity、relationship_keywords、relationship_description
+        """
+        if not chunk or (not entities and not relations):
+            return
+
+        entity_docs: List[Dict[str, Any]] = []
+        for e in entities or []:
+            name = (e.name or "").strip()
+            if not name:
+                continue
+            entity_type = (e.type or "Other").strip() or "Other"
+            entity_description = (e.description or "").strip()
+            entity_text = f"{name}、{entity_type}、{entity_description}"
+            entity_docs.append(
+                {
+                    "entity_id": self._make_stable_id(
+                        "ent",
+                        f"{chunk.chunk_id}|{name}|{entity_type}|{entity_description}",
+                    ),
+                    "chunk_id": chunk.chunk_id,
+                    "document_id": chunk.document_id,
+                    "document_name": chunk.document_name,
+                    "entity_name": name,
+                    "entity_type": entity_type,
+                    "entity_description": entity_description,
+                    "entity_text": entity_text,
+                    "metadata": dict(chunk.metadata or {}),
+                }
+            )
+
+        relation_docs: List[Dict[str, Any]] = []
+        for r in relations or []:
+            src = (r.source or "").strip()
+            tgt = (r.target or "").strip()
+            if not src or not tgt or src == tgt:
+                continue
+            kw_list = [str(k).strip() for k in (r.keywords or []) if str(k).strip()]
+            kw_str = ",".join(kw_list)
+            rel_desc = (r.description or "").strip()
+            relation_text = f"{src}、{tgt}、{kw_str}、{rel_desc}"
+            relation_docs.append(
+                {
+                    "relation_id": self._make_stable_id(
+                        "rel",
+                        f"{chunk.chunk_id}|{src}|{tgt}|{kw_str}|{rel_desc}",
+                    ),
+                    "chunk_id": chunk.chunk_id,
+                    "document_id": chunk.document_id,
+                    "document_name": chunk.document_name,
+                    "source_entity": src,
+                    "target_entity": tgt,
+                    "relationship_keywords": kw_list,
+                    "relationship_description": rel_desc,
+                    "relation_text": relation_text,
+                    "metadata": dict(chunk.metadata or {}),
+                }
+            )
+
+        # 并发向量化
+        entity_texts = [d["entity_text"] for d in entity_docs]
+        relation_texts = [d["relation_text"] for d in relation_docs]
+        (entity_embeddings, relation_embeddings) = await asyncio.gather(
+            self._get_embeddings_batch_async(entity_texts),
+            self._get_embeddings_batch_async(relation_texts),
+        )
+
+        actions: List[Dict[str, Any]] = []
+        for doc, emb in zip(entity_docs, entity_embeddings):
+            if emb is None:
+                continue
+            doc["embedding_entity_text"] = emb
+            actions.append(
+                {
+                    "_op_type": "index",
+                    "_index": self.entity_index_name,
+                    "_id": doc["entity_id"],
+                    "_source": doc,
+                }
+            )
+        for doc, emb in zip(relation_docs, relation_embeddings):
+            if emb is None:
+                continue
+            doc["embedding_relation_text"] = emb
+            actions.append(
+                {
+                    "_op_type": "index",
+                    "_index": self.relation_index_name,
+                    "_id": doc["relation_id"],
+                    "_source": doc,
+                }
+            )
+
+        if not actions:
+            return
+
+        try:
+            success_count, errors = await async_bulk(
+                self.client,
+                actions,
+                chunk_size=min(settings.opensearch.bulk_chunk_size, 500),
+                max_chunk_bytes=10 * 1024 * 1024,
+                raise_on_error=False,
+                max_retries=3,
+            )
+            if errors:
+                log.error(
+                    "图谱索引写入存在失败: success=%s failed=%s",
+                    success_count,
+                    len(errors),
+                )
+        except Exception as e:
+            log.error(f"图谱索引写入失败 (chunk_id={chunk.chunk_id}): {e}", exc_info=True)
+
+    async def vector_search_entities(self, query_text: str, k: int = 10) -> List[Dict[str, Any]]:
+        if not query_text or not query_text.strip():
+            return []
+        query_embedding = await self._get_query_embedding_async(query_text)
+        if not query_embedding:
+            return []
+
+        query = {
+            "size": k,
+            "_source": [
+                "entity_id",
+                "chunk_id",
+                "document_id",
+                "document_name",
+                "entity_name",
+                "entity_type",
+                "entity_description",
+            ],
+            "query": {
+                "knn": {
+                    "embedding_entity_text": {
+                        "vector": query_embedding,
+                        "k": k,
+                    }
+                }
+            },
+        }
+
+        try:
+            response = await self.client.search(index=self.entity_index_name, body=query)
+            hits = response.get("hits", {}).get("hits", []) or []
+            results: List[Dict[str, Any]] = []
+            for h in hits:
+                src = h.get("_source") or {}
+                if not src:
+                    continue
+                results.append({"score": float(h.get("_score") or 0.0), **src})
+            return results
+        except Exception as e:
+            log.error(f"实体向量检索失败: {e}", exc_info=True)
+            return []
+
+    async def vector_search_relations(self, query_text: str, k: int = 10) -> List[Dict[str, Any]]:
+        if not query_text or not query_text.strip():
+            return []
+        query_embedding = await self._get_query_embedding_async(query_text)
+        if not query_embedding:
+            return []
+
+        query = {
+            "size": k,
+            "_source": [
+                "relation_id",
+                "chunk_id",
+                "document_id",
+                "document_name",
+                "source_entity",
+                "target_entity",
+                "relationship_keywords",
+                "relationship_description",
+            ],
+            "query": {
+                "knn": {
+                    "embedding_relation_text": {
+                        "vector": query_embedding,
+                        "k": k,
+                    }
+                }
+            },
+        }
+
+        try:
+            response = await self.client.search(index=self.relation_index_name, body=query)
+            hits = response.get("hits", {}).get("hits", []) or []
+            results: List[Dict[str, Any]] = []
+            for h in hits:
+                src = h.get("_source") or {}
+                if not src:
+                    continue
+                results.append({"score": float(h.get("_score") or 0.0), **src})
+            return results
+        except Exception as e:
+            log.error(f"关系向量检索失败: {e}", exc_info=True)
             return []
 
     # --- 高并发检索算法 ---
@@ -412,6 +646,85 @@ class AsyncOpenSearchRAGStore(SearchRepository):
             log.error(f"混合搜索 (mget) 时出错: {e.status_code} {e.info}", exc_info=True)
             return []
 
+    async def hybrid_search_with_embedding(
+        self,
+        query_text: str,
+        query_embedding: List[float],
+        k: int = 5,
+        rrf_k: int = 60,
+    ) -> List[RetrievedChunk]:
+        """
+        [异步] 混合搜索（使用外部提供的 query embedding）。
+
+        说明：
+        - 用于 services 层先从 Redis 取出 embedding 后的检索路径；
+        - 若未提供 embedding，则降级为内部获取。
+        """
+        log.info(f"--- 开始 *异步* 混合搜索 (预置向量) (查询: '{query_text}') ---")
+
+        if not query_text or not query_text.strip():
+            return []
+
+        if not query_embedding:
+            query_embedding = await self._get_query_embedding_async(query_text)
+        if not query_embedding:
+            return []
+
+        # 并发执行 BM25 和向量搜索
+        bm25_task = self.bm25_search(query_text, k=k * 2)
+        vector_tasks = [
+            self._base_vector_search("embedding_content", query_embedding, k=k * 2),
+            self._base_vector_search("embedding_parent_headings", query_embedding, k=k * 2),
+            self._base_vector_search("embedding_summary", query_embedding, k=k * 2),
+            self._base_vector_search("embedding_hypothetical_questions", query_embedding, k=k * 2),
+        ]
+
+        try:
+            (
+                bm25_results,
+                vec_content_results,
+                vec_headings_results,
+                vec_summary_results,
+                vec_questions_results,
+            ) = await asyncio.gather(bm25_task, *vector_tasks)
+        except Exception as e:
+            log.error(f"混合搜索 (预置向量) 召回阶段失败: {e}", exc_info=True)
+            return []
+
+        all_results_lists = [
+            bm25_results,
+            vec_content_results,
+            vec_headings_results,
+            vec_summary_results,
+            vec_questions_results,
+        ]
+
+        fused_results_with_score = self._rrf_fuse(all_results_lists, k_constant=rrf_k)
+        top_k_results = fused_results_with_score[:k]
+        if not top_k_results:
+            return []
+
+        top_k_ids = [item[0] for item in top_k_results]
+        score_map = {item[0]: item[1] for item in top_k_results}
+
+        try:
+            response = await self.client.mget(index=self.index_name, body={"ids": top_k_ids})
+            docs_map = {
+                doc["_id"]: doc["_source"]
+                for doc in response.get("docs", [])
+                if doc.get("found") and doc.get("_source")
+            }
+
+            retrieved_chunks: List[RetrievedChunk] = []
+            for doc_id in top_k_ids:
+                if doc_id not in docs_map:
+                    continue
+                retrieved_chunks.append(self._convert_to_retrieved_chunk(docs_map[doc_id], score_map[doc_id]))
+            return retrieved_chunks
+        except TransportError as e:
+            log.error(f"混合搜索 (预置向量 mget) 时出错: {e.status_code} {e.info}", exc_info=True)
+            return []
+
     # --- 批量操作 ---
 
     async def _generate_bulk_actions_async(
@@ -540,4 +853,26 @@ class AsyncOpenSearchRAGStore(SearchRepository):
             
         except Exception as e:
             log.error(f"批量混合搜索过程中发生错误: {e}", exc_info=True)
+            return [[] for _ in queries]
+
+    async def hybrid_search_batch_with_embeddings(
+        self,
+        queries: List[str],
+        embeddings: List[List[float]],
+        k: int = 5,
+        rrf_k: int = 60,
+    ) -> List[List[RetrievedChunk]]:
+        if not queries:
+            return []
+        if len(queries) != len(embeddings):
+            raise ValueError("queries 与 embeddings 长度不一致。")
+
+        tasks = [
+            self.hybrid_search_with_embedding(query_text=q, query_embedding=emb, k=k, rrf_k=rrf_k)
+            for q, emb in zip(queries, embeddings)
+        ]
+        try:
+            return await asyncio.gather(*tasks)
+        except Exception as e:
+            log.error(f"批量混合搜索 (预置向量) 过程中发生错误: {e}", exc_info=True)
             return [[] for _ in queries]
