@@ -2,7 +2,9 @@ import asyncio
 import hashlib
 import json
 import logging
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from typing import AsyncGenerator, Dict, List, Optional, Tuple
+
+from pydantic import JsonValue
 
 import jieba
 
@@ -187,7 +189,7 @@ class AsyncOpenSearchRAGStore(SearchRepository):
         return await asyncio.to_thread(self._tokenize_with_jieba_sync, text)
     
     # 数据转换
-    def _convert_to_retrieved_chunk(self, source: Dict[str, Any], score: float) -> RetrievedChunk:
+    def _convert_to_retrieved_chunk(self, source: Dict[str, JsonValue], score: float) -> RetrievedChunk:
         """
         [内部辅助] 将 OpenSearch 的 _source 字典和分数转换为 RetrievedChunk 对象。
         
@@ -212,7 +214,7 @@ class AsyncOpenSearchRAGStore(SearchRepository):
 
     # --- 索引管理 (DDL) ---
 
-    async def _create_index_if_missing(self, index_name: str, mapping_body: Dict[str, Any]) -> None:
+    async def _create_index_if_missing(self, index_name: str, mapping_body: Dict[str, JsonValue]) -> None:
         if await self.client.indices.exists(index=index_name):
             log.warning(f"索引 '{index_name}' 已存在。")
             return
@@ -234,7 +236,7 @@ class AsyncOpenSearchRAGStore(SearchRepository):
 
     # --- 文档读取（供图谱检索回查） ---
 
-    async def mget_documents(self, chunk_ids: List[str]) -> List[Dict[str, Any]]:
+    async def mget_documents(self, chunk_ids: List[str]) -> List[Dict[str, JsonValue]]:
         """
         批量获取文档。
 
@@ -278,7 +280,7 @@ class AsyncOpenSearchRAGStore(SearchRepository):
         if not chunk or (not entities and not relations):
             return
 
-        entity_docs: List[Dict[str, Any]] = []
+        entity_docs: List[Dict[str, JsonValue]] = []
         for e in entities or []:
             name = (e.name or "").strip()
             if not name:
@@ -303,7 +305,7 @@ class AsyncOpenSearchRAGStore(SearchRepository):
                 }
             )
 
-        relation_docs: List[Dict[str, Any]] = []
+        relation_docs: List[Dict[str, JsonValue]] = []
         for r in relations or []:
             src = (r.source or "").strip()
             tgt = (r.target or "").strip()
@@ -339,7 +341,7 @@ class AsyncOpenSearchRAGStore(SearchRepository):
             self._get_embeddings_batch_async(relation_texts),
         )
 
-        actions: List[Dict[str, Any]] = []
+        actions: List[Dict[str, JsonValue]] = []
         for doc, emb in zip(entity_docs, entity_embeddings):
             if emb is None:
                 continue
@@ -386,7 +388,7 @@ class AsyncOpenSearchRAGStore(SearchRepository):
         except Exception as e:
             log.error(f"图谱索引写入失败 (chunk_id={chunk.chunk_id}): {e}", exc_info=True)
 
-    async def vector_search_entities(self, query_text: str, k: int = 10) -> List[Dict[str, Any]]:
+    async def vector_search_entities(self, query_text: str, k: int = 10) -> List[Dict[str, JsonValue]]:
         if not query_text or not query_text.strip():
             return []
         query_embedding = await self._get_query_embedding_async(query_text)
@@ -417,7 +419,7 @@ class AsyncOpenSearchRAGStore(SearchRepository):
         try:
             response = await self.client.search(index=self.entity_index_name, body=query)
             hits = response.get("hits", {}).get("hits", []) or []
-            results: List[Dict[str, Any]] = []
+            results: List[Dict[str, JsonValue]] = []
             for h in hits:
                 src = h.get("_source") or {}
                 if not src:
@@ -428,7 +430,7 @@ class AsyncOpenSearchRAGStore(SearchRepository):
             log.error(f"实体向量检索失败: {e}", exc_info=True)
             return []
 
-    async def vector_search_relations(self, query_text: str, k: int = 10) -> List[Dict[str, Any]]:
+    async def vector_search_relations(self, query_text: str, k: int = 10) -> List[Dict[str, JsonValue]]:
         if not query_text or not query_text.strip():
             return []
         query_embedding = await self._get_query_embedding_async(query_text)
@@ -460,7 +462,7 @@ class AsyncOpenSearchRAGStore(SearchRepository):
         try:
             response = await self.client.search(index=self.relation_index_name, body=query)
             hits = response.get("hits", {}).get("hits", []) or []
-            results: List[Dict[str, Any]] = []
+            results: List[Dict[str, JsonValue]] = []
             for h in hits:
                 src = h.get("_source") or {}
                 if not src:
@@ -473,7 +475,7 @@ class AsyncOpenSearchRAGStore(SearchRepository):
 
     # --- 高并发检索算法 ---
 
-    async def bm25_search(self, query_text: str, k: int = 5) -> List[Dict[str, Any]]:
+    async def bm25_search(self, query_text: str, k: int = 5) -> List[Dict[str, JsonValue]]:
         tokenized_query = await self._tokenize_with_jieba_async(query_text)
         log.debug(f"[BM25] 原始查询: '{query_text}', Jieba分词: '{tokenized_query}'")
         
@@ -504,7 +506,7 @@ class AsyncOpenSearchRAGStore(SearchRepository):
             log.error(f"BM25 (multi_match) 检索时出错: {e.status_code} {e.info}", exc_info=True)
             return []
 
-    async def _base_vector_search(self, field_name: str, query_embedding: List[float], k: int) -> List[Dict[str, Any]]:
+    async def _base_vector_search(self, field_name: str, query_embedding: List[float], k: int) -> List[Dict[str, JsonValue]]:
         query = {
             "size": k,
             "query": {
@@ -527,7 +529,7 @@ class AsyncOpenSearchRAGStore(SearchRepository):
             return []
 
     def _rrf_fuse(self, 
-                  results_lists: List[List[Dict[str, Any]]], 
+                  results_lists: List[List[Dict[str, JsonValue]]], 
                   k_constant: int = 60) -> List[Tuple[str, float]]:
         """
         使用 RRF 融合多路召回结果。
@@ -730,7 +732,7 @@ class AsyncOpenSearchRAGStore(SearchRepository):
     async def _generate_bulk_actions_async(
         self, 
         documents: List[DocumentChunk]
-    ) -> AsyncGenerator[Dict[str, Any], None]:
+    ) -> AsyncGenerator[Dict[str, JsonValue], None]:
         
         all_content = [doc.content for doc in documents]
         all_headings = [" ".join(doc.parent_headings) for doc in documents]

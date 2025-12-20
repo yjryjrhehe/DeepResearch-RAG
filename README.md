@@ -52,20 +52,91 @@ flowchart LR
 
 流程说明：
 
-1. API 接收上传文件并保存到本地 `uploads/`；构建 `DocumentSource`（含 `document_id/document_name/file_path/metadata`）。
-2. 调用 `IngestionService.pipeline()`（`backend/services/ingestion_service.py`）。
-3. 解析：`DoclingParser.parse()`（`backend/infrastructure/parse/parser.py`）调用 Docling `DocumentConverter`，在 PDF/DOCX 场景下按配置启用 VLM/LLM 增强管道（公式/图片/表格/可选 OCR），输出 Markdown。
-4. 分块：`MarkdownSplitter.split()`（`backend/infrastructure/parse/splitter.py`）先按 Markdown 标题结构切分，再对超长块按 token 阈值做二次递归切分，生成 `DocumentChunk[]`。
+1. API 读取文件流并计算 SHA256（作为 `document_id`），将文件保存为 `uploads/{document_id}{ext}`；在 SQLite `documents` 表创建 `PENDING` 记录。
+2. API 投递 `Taskiq` 后台任务 `process_document_ingestion(document_id)` 并立即返回 `202 Accepted`。
+3. Worker 接收任务后将文档状态更新为 `PROCESSING`，从数据库加载文件路径并构建 `DocumentSource`。
+4. Worker 调用 `IngestionService.pipeline()`（`backend/services/ingestion_service.py`）完成解析/切分/预处理/入库/图谱增量更新，成功更新为 `PROCESSED`，失败更新为 `FAILED` 并记录错误信息。
 
 ```mermaid
 flowchart TD
-    A[POST /api/documents/upload] --> B["保存文件到 uploads/"]
-    B --> C[构建 DocumentSource]
-    C --> D[IngestionService.pipeline]
-    D --> E["DoclingParser.parse\n(DocumentConverter + VLM/LLM Enrichment)"]
-    E --> F[Markdown 文本]
-    F --> G["MarkdownSplitter.split\n(按标题切分 + token 二次分割)"]
-    G --> H["initial_chunks: DocumentChunk[]"]
+    A[POST /api/documents/upload] --> B["保存文件到 uploads/{sha256}{ext} + 计算 SHA256"]
+    B --> C["SQLite: documents(PENDING)"]
+    C --> D["Taskiq: enqueue process_document_ingestion(document_id)"]
+    D --> E[Worker]
+    E --> F["SQLite: documents(PROCESSING)"]
+    F --> G[构建 DocumentSource]
+    G --> H[IngestionService.pipeline]
+    H --> I["SQLite: documents(PROCESSED/FAILED)"]
+```
+
+**流程说明（当前实现）**
+
+1. 客户端调用 POST /api/documents/upload 上传文件（server.py 的 upload_and_enqueue）。
+2. API 以流式方式一边写入临时文件 *.upload，一边计算 SHA256；SHA256 十六进制串作为 document_id（并限制最大 300MB）。
+3. API 用document_id查询 SQLite 的documents表（SQLAlchemy 仓储sqlalchemy_document_repository.py）做去重：
+   - 已存在且 PROCESSED：删除临时文件，直接 200 OK 返回已有文档信息（秒传）。
+   - 已存在且 PENDING/PROCESSING：删除临时文件，返回 202 Accepted（不重复入队）。
+   - 已存在且 FAILED：将其重置为 PENDING，投递后台任务，返回 202 Accepted。
+   - 不存在：将临时文件原子移动为 uploads/{document_id}{ext}，创建 documents(PENDING) 记录，投递后台任务，返回 202 Accepted（包含 task_id）。
+4. Taskiq Worker 消费任务process_document_ingestion(document_id)（tasks.py）：
+   - 将文档状态更新为 PROCESSING（记录 processing_started_at、attempt_count+1）。
+   - 从数据库加载 file_path，构建 DocumentSource，调用 IngestionService.pipeline(source)（ingestion_service.py）。
+5. IngestionService.pipeline依次执行：
+   - 解析：DocumentParser.parse（Docling）→ Markdown
+   - 切分：TextSplitter.split（MarkdownSplitter）→ initial_chunks
+   - 预处理：PreProcessor.run_concurrent_preprocessing（LLM 并发增强）→ enriched chunks
+   - 入库：按 BATCH_SIZE=50 批量调用 SearchRepository.bulk_add_documents 写入 OpenSearch（chunks 索引）
+   - 可选图谱：对每个 chunk 抽取实体/关系并写入 Neo4j，同时写入 OpenSearch 的 entity/relation 索引
+6. Worker 根据执行结果回写状态：
+   - 成功：更新为 PROCESSED，记录 processing_finished_at 与 chunks_count
+   - 失败：更新为 FAILED，写入 error_message 与 processing_finished_at（可通过 API 触发重试）
+
+**Mermaid 流程图**
+
+```mermaid
+flowchart TD
+    U[客户端] -->|POST /api/documents/upload| API[FastAPI: upload_and_enqueue]
+
+    API --> TMP["流式保存临时文件\nuploads/_tmp/*.upload\n并计算 SHA256"]
+    TMP --> DOCID["document_id = sha256_hex"]
+    DOCID -->|查询| DB[(SQLite: documents)]
+
+    DB -->|已存在 & PROCESSED| HIT200["200 OK\n返回已有 DocumentRecord\n(秒传)"]
+    DB -->|已存在 & PENDING/PROCESSING| HIT202["202 Accepted\n返回已有 DocumentRecord\n(不重复入队)"]
+    DB -->|已存在 & FAILED| RESET["FAILED -> PENDING\n清理 error/时间字段"]
+    RESET --> ENQ1["Taskiq enqueue\nprocess_document_ingestion(document_id)"]
+
+    DB -->|不存在| MOVE["原子移动为\nuploads/{document_id}{ext}"]
+    MOVE --> CREATE["插入 documents(PENDING)\n保存 file_path/original_filename/size"]
+    CREATE --> ENQ2["Taskiq enqueue\nprocess_document_ingestion(document_id)"]
+
+    ENQ1 --> RET202["202 Accepted\n返回 document + task_id"]
+    ENQ2 --> RET202
+    HIT200 --> DONE[客户端结束]
+    HIT202 --> DONE
+    RET202 --> DONE
+
+    subgraph W[Taskiq Worker]
+      ENQ1 --> TASK[process_document_ingestion]
+      ENQ2 --> TASK
+      TASK --> SETPROC["documents: PROCESSING\nstarted_at + attempt_count+1"]
+      SETPROC --> LOAD["从 DB 加载 file_path\n构建 DocumentSource"]
+      LOAD --> PARSE["DoclingParser.parse\n-> Markdown"]
+      PARSE --> SPLIT["MarkdownSplitter.split\n-> initial_chunks"]
+      SPLIT --> PRE["LLMPreprocessor.run_concurrent_preprocessing\n-> enriched chunks"]
+      PRE -->|batch=50| OS["OpenSearch: bulk_add_documents\n-> chunks 索引/embedding"]
+      PRE --> KGX{启用图谱?}
+      KGX -->|是| KG["GraphExtractor.extract\nNeo4j upsert\n+ OpenSearch entity/relation 索引"]
+      KGX -->|否| SKIP[跳过]
+      OS --> FIN["documents: PROCESSED\nfinished_at + chunks_count"]
+      KG --> FIN
+
+      PARSE -.异常.-> FAIL["documents: FAILED\nerror_message + finished_at"]
+      SPLIT -.异常.-> FAIL
+      PRE -.异常.-> FAIL
+      OS -.异常.-> FAIL
+      KG -.异常.-> FAIL
+    end
 ```
 
 ## 2) 文本块预处理，并存入 OpenSearch（Chunk 索引）
@@ -184,32 +255,32 @@ flowchart TD
     B --> D[合并候选端点并去重]
     C --> D
     D --> E[Neo4j 回查候选实体并计算节点度 Degree]
-    
+
     E --> F[按 Degree 筛选 Top-K 实体]
     E --> G["按“端点 Degree 之和”筛选 Top-K 关系"]
-    
+
     %% 修改点1：构建种子集合（逻辑上的合并）
     F -- "实体作为 Seed" --> SeedMerge((合并 Seed))
     G -- "关系端点作为 Seed" --> SeedMerge
-    
+
     %% 修改点2：基于 Seed 进行邻居扩展
     SeedMerge --> H["对所有 Seed 扩展 1 跳邻居与相连边"]
-    
+
     %% 关系验证逻辑保持不变
     G --> I["回查 Top-K 候选关系的真实边属性\n(仅保留 Neo4j 中存在的边)"]
-    
+
     %% 合并逻辑
     H --> J["合并/去重关系，并补齐属性"]
     I --> J
-    
+
     J --> K[按 degree_score + weight 排序并截断关系]
-    
+
     %% 修改点3：Chunk 召回基于所有 Seed
     SeedMerge --> L[聚合与 Seed 实体相关的 chunk_id]
-    
+
     %% 修改点4：新增关系级 Chunk 召回 (代码 Step 8)
     K --> N[聚合同时提及关系两端的 chunk_id]
-    
+
     %% 输出
     L --> M["输出结构化图谱上下文\n(实体/关系/chunk_id/映射)"]
     K --> M
@@ -308,6 +379,8 @@ python -m pip install -e .
 
 - OpenSearch 索引：`OPENSEARCH_INDEX_NAME` / `OPENSEARCH_ENTITY_INDEX_NAME` / `OPENSEARCH_RELATION_INDEX_NAME`
 - Embedding（Ollama 常用地址示例）：`EMBEDDING_LLM_BASE_URL=http://localhost:11434`
+- SQLite：`DATABASE_URL` / `DATABASE_ECHO`
+- Taskiq：`TASKIQ_BROKER_URL` / `TASKIQ_QUEUE_NAME`
 
 ## 3) 启动依赖（Docker Compose）
 
@@ -338,9 +411,30 @@ python main.py
 
 说明：API 启动时会自动检查/创建 OpenSearch 索引（chunk/entity/relation）。
 
+## 5) 启动 Worker（Taskiq）
+
+上传接口会将文档处理投递到任务队列，因此需要同时启动 worker：
+
+```bash
+python worker.py --workers 2 --log-level INFO
+```
+
+或直接使用 taskiq CLI：
+
+```bash
+python -m taskiq worker backend.infrastructure.task_queue.broker:broker backend.worker.tasks
+```
+
 # 接口说明
 
 - `GET /api/health`：健康检查
-- `POST /api/documents/upload?stream=true`：上传并摄入（SSE 流式日志）
+- `POST /api/documents/upload`：上传并入队（返回 202 + document_id）
+- `GET /api/documents`：文档列表（支持状态过滤）
+- `GET /api/documents/{document_id}`：文档详情
+- `POST /api/documents/retry_failed`：重试所有失败文档
+- `POST /api/documents/{document_id}/reprocess`：手动重处理指定文档
 - `POST /api/query`：问答（返回回答 + 引用 + 证据块）
+- `POST /api/query/tasks`：创建异步查询任务（202）
+- `GET /api/query/tasks`：查询任务列表
+- `GET /api/query/tasks/{task_id}/result`：获取异步查询结果（Redis）
 - `GET /api/graph/entity/{entity_name}`：实体子图

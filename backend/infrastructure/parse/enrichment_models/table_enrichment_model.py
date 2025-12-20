@@ -3,7 +3,7 @@ import base64
 import concurrent.futures
 from io import BytesIO
 from collections.abc import Iterable
-from typing import Any, Literal
+from typing import Literal
 
 # --- Pydantic 和 PIL ---
 from pydantic import Field
@@ -233,7 +233,7 @@ class LLMTableEnrichmentModel(BaseEnrichmentModel):
 
     def __call__(
         self, doc: DoclingDocument, element_batch: Iterable[NodeItem]
-    ) -> Iterable[Any]:
+    ) -> Iterable[TableItem]:
         """
         docling pipeline 的主调用函数，处理一批元素。
         
@@ -263,7 +263,6 @@ class LLMTableEnrichmentModel(BaseEnrichmentModel):
                 except Exception as e:
                     log.error(f"多线程处理表格时发生严重错误: {e}", exc_info=True)
                     pass 
-
 
 
 

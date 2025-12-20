@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import List, Optional, Dict, Any, Awaitable, Callable, TypeVar
+from typing import List, Optional, Dict, Awaitable, Callable, TypeVar
+
+from pydantic import JsonValue
 
 from neo4j import AsyncGraphDatabase, AsyncDriver
 from neo4j.exceptions import ServiceUnavailable, SessionExpired
@@ -198,7 +200,7 @@ class Neo4jGraphRepository(GraphRepository):
         top_k_entities: int = 10,
         top_k_relations: int = 10,
         top_k_chunks: int = 20,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, JsonValue]:
         """
         返回图谱上下文：实体、关系、以及关联 chunk_id。
 
@@ -266,7 +268,7 @@ class Neo4jGraphRepository(GraphRepository):
             result = await session.run(cypher_entity_degrees, names=candidate_names)
             rows = await result.data()
 
-        entity_map: Dict[str, Dict[str, Any]] = {}
+        entity_map: Dict[str, Dict[str, JsonValue]] = {}
         degree_map: Dict[str, int] = {}
         for r in rows:
             name = r.get("name")
@@ -355,7 +357,7 @@ class Neo4jGraphRepository(GraphRepository):
             neighbor_rows = await result.data()
 
         all_names: List[str] = []
-        relations_map: Dict[tuple[str, str], Dict[str, Any]] = {}
+        relations_map: Dict[tuple[str, str], Dict[str, JsonValue]] = {}
         neighbor_names: set[str] = set()
         for r in neighbor_rows:
             src = r.get("source")
@@ -459,7 +461,7 @@ class Neo4jGraphRepository(GraphRepository):
 
         # --- 6) 关系按 degree_score 排序并截断 ---
         # 把 relations_map 里的候选边做最终筛选
-        relations: List[Dict[str, Any]] = []
+        relations: List[Dict[str, JsonValue]] = []
         for rel in relations_map.values():
             src = rel.get("source")
             tgt = rel.get("target")
@@ -511,7 +513,7 @@ class Neo4jGraphRepository(GraphRepository):
             chunk_ids = [r["chunk_id"] for r in chunk_rows if r.get("chunk_id")]
 
         # --- 8) （可选）关系相关 chunk_id：同时提及两端实体的 chunk ---
-        relation_to_chunk_ids: List[Dict[str, Any]] = []
+        relation_to_chunk_ids: List[Dict[str, JsonValue]] = []
         if relations:
             pairs_payload = [
                 {"source": r.get("source"), "target": r.get("target")}
@@ -554,7 +556,7 @@ class Neo4jGraphRepository(GraphRepository):
             "seed_entities": seed_names,
         }
 
-    async def get_entity_subgraph(self, entity_name: str, depth: int = 1) -> Dict[str, Any]:
+    async def get_entity_subgraph(self, entity_name: str, depth: int = 1) -> Dict[str, JsonValue]:
         await self._ensure_initialized()
         # 目前提供 depth=1 的轻量子图，便于前端展示与调试
         cypher = """

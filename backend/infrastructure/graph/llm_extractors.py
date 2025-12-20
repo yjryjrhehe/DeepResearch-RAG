@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 import logging
-from typing import List, Tuple, Any
+from typing import List, Tuple
 import hashlib
 import json
 

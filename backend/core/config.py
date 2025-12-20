@@ -158,6 +158,24 @@ class RedisSettings(BaseConfigSettings):
     embedding_ttl_seconds: int = 7 * 24 * 60 * 60  # 7 天
 
 
+class DatabaseSettings(BaseConfigSettings):
+    """数据库配置（SQLite/SQLAlchemy）。"""
+
+    model_config = SettingsConfigDict(env_prefix="DATABASE_")
+
+    url: str = "sqlite+aiosqlite:///./deepresearch_rag.sqlite3"
+    echo: bool = False
+
+
+class TaskiqSettings(BaseConfigSettings):
+    """Taskiq 任务队列配置（Redis Broker）。"""
+
+    model_config = SettingsConfigDict(env_prefix="TASKIQ_")
+
+    broker_url: str = "redis://localhost:6379/0"
+    queue_name: str = "deepresearch_rag"
+
+
 class Neo4jSettings(BaseConfigSettings):
     """Neo4j 配置（用于知识图谱）"""
     model_config = SettingsConfigDict(env_prefix="NEO4J_")
@@ -204,6 +222,8 @@ class Settings(BaseConfigSettings):
     tei_rerank: TeiRerankSettings = Field(default_factory=TeiRerankSettings)
     opensearch: OpenSearchSettings = Field(default_factory=OpenSearchSettings)
     redis: RedisSettings = Field(default_factory=RedisSettings)
+    database: DatabaseSettings = Field(default_factory=DatabaseSettings)
+    taskiq: TaskiqSettings = Field(default_factory=TaskiqSettings)
     neo4j: Neo4jSettings = Field(default_factory=Neo4jSettings)
     kg: KnowledgeGraphSettings = Field(default_factory=KnowledgeGraphSettings)
 

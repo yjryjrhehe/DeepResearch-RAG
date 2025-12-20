@@ -14,7 +14,9 @@ import asyncio
 import hashlib
 import json
 from collections import Counter
-from typing import List, Dict, Tuple, Any, Optional
+from typing import List, Dict, Tuple, Optional
+
+from pydantic import JsonValue
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate
@@ -79,7 +81,7 @@ def _build_references_by_document_title(
 
 def _build_context(
     *,
-    graph_context: Dict[str, Any],
+    graph_context: Dict[str, JsonValue],
     chunks: List[RetrievedChunk],
     title_to_ref: Dict[str, str],
 ) -> str:
@@ -315,7 +317,7 @@ class RagService(RAGOrchestrator):
         *,
         use_low_level: bool = True,
         use_high_level: bool = True,
-    ) -> Tuple[Dict[str, Any], List[RetrievedChunk]]:
+    ) -> Tuple[Dict[str, JsonValue], List[RetrievedChunk]]:
         high, low = await self._keyword_extractor.extract(query)
         keywords: List[str] = []
         if use_low_level:
@@ -376,7 +378,7 @@ class RagService(RAGOrchestrator):
         if not query or not query.strip():
             return AnswerResult(answer="问题为空，无法回答。", references=[], chunks=[], graph_context={})
 
-        graph_context: Dict[str, Any] = {}
+        graph_context: Dict[str, JsonValue] = {}
         vector_chunks: List[RetrievedChunk] = []
         graph_chunks: List[RetrievedChunk] = []
 

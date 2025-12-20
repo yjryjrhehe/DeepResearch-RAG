@@ -3,7 +3,6 @@ import logging
 import base64
 from io import BytesIO
 from collections.abc import Iterable
-from typing import Any
 
 from openai import OpenAI  # 用于 VLM API 调用
 from PIL import Image  # 用于处理图像
@@ -111,12 +110,14 @@ class VLMPictureEnrichmentModel(BaseEnrichmentModel):
     
     def __call__(
         self, doc: DoclingDocument, element_batch: Iterable[NodeItem]
-    ) -> Iterable[Any]:
+    ) -> Iterable[NodeItem]:
         """
         处理一批元素 (由 docling 传入)，使用多线程并行处理 VLM Call。
         """
         # 1. 检查 VLM 是否被禁用
         if not self.enabled:
+            for element in element_batch:
+                yield element
             return
 
         # 2. 准备线程池和任务映射
@@ -203,7 +204,6 @@ class VLMPictureEnrichmentModel(BaseEnrichmentModel):
                     yield element
         
         log.info("VLM 批处理全部完成。")
-
 
 
 
