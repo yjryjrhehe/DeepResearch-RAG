@@ -1,7 +1,5 @@
 """Taskiq 任务队列服务实现。"""
 
-from __future__ import annotations
-
 from ...domain.task_queue import TaskQueueService
 from ...worker.tasks import process_document_ingestion, process_rag_query
 
@@ -16,4 +14,3 @@ class TaskiqTaskQueueService(TaskQueueService):
     async def enqueue_rag_query(self, task_id: str) -> str:
         task = await process_rag_query.kiq(task_id=task_id)
         return task.task_id
-

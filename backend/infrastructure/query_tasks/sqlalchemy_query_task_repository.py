@@ -1,7 +1,5 @@
 """基于 SQLAlchemy 的查询任务仓储实现。"""
 
-from __future__ import annotations
-
 from datetime import datetime
 
 from pydantic import JsonValue
@@ -25,9 +23,15 @@ class SqlAlchemyQueryTaskRepository(QueryTaskRepository):
     """使用 SQLite + SQLAlchemy 的查询任务仓储实现。"""
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        """初始化仓储。
+
+        Args:
+            session_factory: 已配置好的异步 Session 工厂。
+        """
         self._session_factory = session_factory
 
     async def get(self, task_id: str) -> QueryTaskRecord | None:
+        """获取单个查询任务记录。"""
         async with self._session_factory() as session:
             orm_obj = await session.get(QueryTaskOrm, task_id)
             if orm_obj is None:
@@ -35,6 +39,7 @@ class SqlAlchemyQueryTaskRepository(QueryTaskRepository):
             return _to_domain_query_task(orm_obj)
 
     async def create_pending(self, task: QueryTaskCreate) -> QueryTaskRecord:
+        """创建一条 PENDING 状态的查询任务记录。"""
         orm_obj = QueryTaskOrm(
             task_id=task.task_id,
             status=QueryTaskStatus.PENDING.value,
@@ -50,7 +55,7 @@ class SqlAlchemyQueryTaskRepository(QueryTaskRepository):
                 await session.commit()
             except IntegrityError as exc:
                 await session.rollback()
-                raise ValueError(f"task_id 已存在: {task.task_id}") from exc
+                raise ValueError(f"task_id 已存在 {task.task_id}") from exc
             await session.refresh(orm_obj)
             return _to_domain_query_task(orm_obj)
 
@@ -61,6 +66,7 @@ class SqlAlchemyQueryTaskRepository(QueryTaskRepository):
         limit: int = 100,
         offset: int = 0,
     ) -> list[QueryTaskRecord]:
+        """查询任务列表，支持按状态过滤。"""
         stmt = select(QueryTaskOrm).order_by(QueryTaskOrm.updated_at.desc())
         if status is not None:
             stmt = stmt.where(QueryTaskOrm.status == status.value)
@@ -82,6 +88,7 @@ class SqlAlchemyQueryTaskRepository(QueryTaskRepository):
         result_redis_key: str | None = None,
         result_preview: str | None = None,
     ) -> QueryTaskRecord:
+        """更新任务状态与结果引用。"""
         async with self._session_factory() as session:
             orm_obj = await session.get(QueryTaskOrm, task_id)
             if orm_obj is None:

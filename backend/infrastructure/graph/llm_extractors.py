@@ -6,8 +6,6 @@
 - 文本块实体/关系抽取（用于知识图谱增量更新）
 """
 
-from __future__ import annotations
-
 import re
 import logging
 from typing import List, Tuple

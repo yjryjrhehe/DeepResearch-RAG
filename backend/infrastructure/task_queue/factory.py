@@ -1,7 +1,5 @@
 """任务队列服务工厂方法。"""
 
-from __future__ import annotations
-
 from functools import lru_cache
 
 from ...domain.task_queue import TaskQueueService

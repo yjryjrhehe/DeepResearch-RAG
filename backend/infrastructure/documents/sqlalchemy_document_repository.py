@@ -1,7 +1,5 @@
 """基于 SQLAlchemy 的文档仓储实现。"""
 
-from __future__ import annotations
-
 from datetime import datetime
 from pathlib import Path
 
@@ -26,9 +24,15 @@ class SqlAlchemyDocumentRepository(DocumentRepository):
     """使用 SQLite + SQLAlchemy 的文档仓储实现。"""
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        """初始化仓储。
+
+        Args:
+            session_factory: 已配置好的异步 Session 工厂。
+        """
         self._session_factory = session_factory
 
     async def get(self, document_id: str) -> DocumentRecord | None:
+        """获取单个文档记录。"""
         async with self._session_factory() as session:
             orm_obj = await session.get(DocumentOrm, document_id)
             if orm_obj is None:
@@ -36,6 +40,7 @@ class SqlAlchemyDocumentRepository(DocumentRepository):
             return _to_domain_document(orm_obj)
 
     async def create_pending(self, document: DocumentCreate) -> DocumentRecord:
+        """创建一条 PENDING 状态的文档记录。"""
         orm_obj = DocumentOrm(
             document_id=document.document_id,
             status=DocumentStatus.PENDING.value,
@@ -53,17 +58,18 @@ class SqlAlchemyDocumentRepository(DocumentRepository):
                 await session.commit()
             except IntegrityError as exc:
                 await session.rollback()
-                raise ValueError(f"document_id 已存在: {document.document_id}") from exc
+                raise ValueError(f"document_id 已存在 {document.document_id}") from exc
             await session.refresh(orm_obj)
             return _to_domain_document(orm_obj)
 
-    async def list(
+    async def list_documents(
         self,
         *,
         status: DocumentStatus | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[DocumentRecord]:
+        """查询文档列表，支持按状态过滤。"""
         stmt = select(DocumentOrm).order_by(DocumentOrm.updated_at.desc())
         if status is not None:
             stmt = stmt.where(DocumentOrm.status == status.value)
@@ -85,6 +91,7 @@ class SqlAlchemyDocumentRepository(DocumentRepository):
         chunks_count: int | None = None,
         increment_attempt: bool = False,
     ) -> DocumentRecord:
+        """更新文档状态与处理信息。"""
         async with self._session_factory() as session:
             orm_obj = await session.get(DocumentOrm, document_id)
             if orm_obj is None:
@@ -110,6 +117,7 @@ class SqlAlchemyDocumentRepository(DocumentRepository):
             return _to_domain_document(orm_obj)
 
     async def reset_failed_to_pending(self, *, document_id: str) -> DocumentRecord:
+        """将 FAILED 文档重置为 PENDING 以便重试。"""
         async with self._session_factory() as session:
             orm_obj = await session.get(DocumentOrm, document_id)
             if orm_obj is None:
@@ -126,6 +134,7 @@ class SqlAlchemyDocumentRepository(DocumentRepository):
             return _to_domain_document(orm_obj)
 
     async def list_retryable_failed(self, *, limit: int = 100) -> list[DocumentRecord]:
+        """列出可重试的失败文档。"""
         stmt = (
             select(DocumentOrm)
             .where(DocumentOrm.status == DocumentStatus.FAILED.value)

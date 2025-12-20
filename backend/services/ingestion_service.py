@@ -4,8 +4,6 @@
 并以可复用的方法拆分关键阶段，便于被后台任务（Worker）调用。
 """
 
-from __future__ import annotations
-
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable

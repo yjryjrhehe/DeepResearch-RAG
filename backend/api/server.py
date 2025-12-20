@@ -7,8 +7,6 @@
 - 异步问答（可选）：创建 query_tasks 并投递后台任务，结果暂存 Redis
 """
 
-from __future__ import annotations
-
 import hashlib
 import json
 import os
@@ -31,6 +29,7 @@ from ..domain.query_tasks import QueryTaskCreate, QueryTaskRepository, QueryTask
 from ..domain.task_queue import TaskQueueService
 from ..domain.interfaces import GraphRepository
 from ..infrastructure.db import init_db
+from ..infrastructure.db.factory import utc_now
 from ..infrastructure.documents.factory import get_document_repository
 from ..infrastructure.graph.factory import get_graph_repository
 from ..infrastructure.query_tasks.factory import get_query_task_repository
@@ -251,7 +250,7 @@ async def list_documents(
 ) -> DocumentListResponse:
     """获取文档列表（支持状态过滤）。"""
 
-    items = await document_repo.list(status=status, limit=limit, offset=offset)
+    items = await document_repo.list_documents(status=status, limit=limit, offset=offset)
     return DocumentListResponse(items=items)
 
 
@@ -309,12 +308,57 @@ async def reprocess_document(
 
 
 @app.post("/api/query", response_model=QueryResponse)
-async def query(req: QueryRequest) -> QueryResponse:
-    """同步问答接口。"""
+async def query(
+    req: QueryRequest,
+    query_repo: QueryTaskRepository = Depends(get_query_task_repository),
+) -> QueryResponse:
+    """即时响应问答接口（立刻执行并持久化记录与结果）。"""
 
-    rag = get_rag_service()
-    result = await rag.ask(req.query, retrieval_mode=req.retrieval_mode)
-    return QueryResponse(**result.model_dump(), request_id=str(uuid.uuid4()))
+    task_id = str(uuid.uuid4())
+    record = await query_repo.create_pending(
+        QueryTaskCreate(
+            task_id=task_id,
+            query=req.query,
+            retrieval_mode=req.retrieval_mode.value,
+            metadata={},
+        )
+    )
+
+    await query_repo.update_status(
+        task_id=task_id,
+        status=QueryTaskStatus.PROCESSING,
+        processing_started_at=utc_now(),
+    )
+
+    try:
+        rag = get_rag_service()
+        result = await rag.ask(req.query, retrieval_mode=req.retrieval_mode)
+
+        result_key: str | None = None
+        if settings.redis.enabled:
+            redis = await _get_redis()
+            result_payload = result.model_dump()
+            result_key = f"rag:query_task:{task_id}"
+            await redis.set(result_key, json.dumps(result_payload, ensure_ascii=False).encode("utf-8"))
+
+        preview = result.answer[:200]
+        record = await query_repo.update_status(
+            task_id=task_id,
+            status=QueryTaskStatus.PROCESSED,
+            processing_finished_at=utc_now(),
+            result_redis_key=result_key,
+            result_preview=preview,
+        )
+
+        return QueryResponse(task=record, result=result, request_id=str(uuid.uuid4()))
+    except Exception as exc:
+        await query_repo.update_status(
+            task_id=task_id,
+            status=QueryTaskStatus.FAILED,
+            error_message=str(exc),
+            processing_finished_at=utc_now(),
+        )
+        raise
 
 
 @app.post("/api/query/tasks", response_model=CreateQueryTaskResponse)

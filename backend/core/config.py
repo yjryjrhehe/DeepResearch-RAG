@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 from typing import List, Tuple, Optional
 
@@ -103,7 +102,7 @@ class DoclingGeneralSettings(BaseConfigSettings):
     do_table_enrichment: bool = True
     do_pic_enrichment: bool = True
     do_ocr: bool = False
-    
+
     accelerator_device: str = "CPU"
     accelerator_num_threads: int = 4
 
@@ -113,7 +112,7 @@ class TextSplitterSettings(BaseConfigSettings):
     max_chunk_tokens: int = Field(default=1024, validation_alias="MAX_CHUNK_TOKENS")
     encoding_name: str = Field(default="cl100k_base", validation_alias="ENCODING_NAME")
     chunk_overlap_tokens: int = Field(default=100, validation_alias="CHUNK_OVERLAP_TOKENS")
-    
+
     headers_to_split_on: List[Tuple[str, str]] = Field(
         default=[
             ("#", "Header 1"), ("##", "Header 2"), ("###", "Header 3"),
@@ -127,7 +126,7 @@ class TextSplitterSettings(BaseConfigSettings):
 class TeiRerankSettings(BaseConfigSettings):
     """TEI Reranker 配置"""
     model_config = SettingsConfigDict(env_prefix="TEI_RERANK_")
-    
+
     base_url: str = "http://localhost:8082"
     api_key: Optional[str] = None
     max_concurrency: int = 50
@@ -137,7 +136,7 @@ class TeiRerankSettings(BaseConfigSettings):
 class OpenSearchSettings(BaseConfigSettings):
     """OpenSearch 配置"""
     model_config = SettingsConfigDict(env_prefix="OPENSEARCH_")
-    
+
     index_name: str = "rag_system_chunks_async"
     entity_index_name: str = "rag_system_entities_async"
     relation_index_name: str = "rag_system_relations_async"
@@ -210,15 +209,15 @@ class Settings(BaseConfigSettings):
     docling_vlm: DoclingVLMSettings = Field(default_factory=DoclingVLMSettings)
     docling_llm: DoclingLLMSettings = Field(default_factory=DoclingLLMSettings)
     docling_general: DoclingGeneralSettings = Field(default_factory=DoclingGeneralSettings)
-    
+
     splitter: TextSplitterSettings = Field(default_factory=TextSplitterSettings)
-    
+
     # LLM 实例
     preprocessing_llm: PreprocessingLLMSettings = Field(default_factory=PreprocessingLLMSettings)
     embedding_llm: EmbeddingLLMSettings = Field(default_factory=EmbeddingLLMSettings)
     rewrite_llm: RewriteLLMSettings = Field(default_factory=RewriteLLMSettings)
     research_llm : ResearchLLMSettings = Field(default_factory=ResearchLLMSettings)
-    
+
     tei_rerank: TeiRerankSettings = Field(default_factory=TeiRerankSettings)
     opensearch: OpenSearchSettings = Field(default_factory=OpenSearchSettings)
     redis: RedisSettings = Field(default_factory=RedisSettings)
@@ -229,12 +228,12 @@ class Settings(BaseConfigSettings):
 
     def get_llm_config_by_name(self, name: str) -> LLMProviderConfig:
         """
-        [工厂方法支持] 
+        [工厂方法支持]
         根据名称动态获取 LLM 配置实例，用于解耦 LLM Factory 的调用。
-        
+
         Args:
             name: 配置名称，例如 'rewrite', 'embedding', 'research', 'preprocess'
-        
+
         Returns:
             LLMProviderConfig: 统一的配置对象
         """
@@ -247,11 +246,11 @@ class Settings(BaseConfigSettings):
             "docling": self.docling_llm,
             "vlm": self.docling_vlm
         }
-        
+
         normalized_name = name.lower().strip()
         if normalized_name not in mapping:
             raise ValueError(f"未知的 LLM 配置名称: '{name}'。可用选项: {list(mapping.keys())}")
-            
+
         return mapping[normalized_name]
 
 

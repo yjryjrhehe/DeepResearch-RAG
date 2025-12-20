@@ -1,7 +1,7 @@
 """
 Neo4j 知识图谱存储实现。
 
-图谱设计（简化版）：
+图谱设计：
 - (:Entity {name, type, description})
 - (:Chunk {chunk_id, document_id, document_name})
 - (:Chunk)-[:MENTIONS]->(:Entity)
@@ -12,8 +12,6 @@ Neo4j 知识图谱存储实现。
 2) 关系按无向关系处理：写入时对 (source, target) 做字典序规范化，避免重复边；
 3) 动态更新：同一实体/关系出现时，做 MERGE 并叠加/合并属性（weight、keywords 等）。
 """
-
-from __future__ import annotations
 
 import asyncio
 import logging
@@ -313,8 +311,8 @@ class Neo4jGraphRepository(GraphRepository):
             scored_rel_pairs.append((src, tgt, degree_map.get(src, 0) + degree_map.get(tgt, 0)))
         scored_rel_pairs.sort(key=lambda x: (x[2], x[0], x[1]), reverse=True)
         top_rel_pairs = [(s, t) for s, t, _ in scored_rel_pairs[:safe_top_k_relations]]
-        
-        # 把实体 和 关系两端节点 合并 
+
+        # 把实体 和 关系两端节点 合并
         seed_names = _dedupe_keep_order(
             top_entity_names + [s for s, _ in top_rel_pairs] + [t for _, t in top_rel_pairs]
         )

@@ -9,8 +9,6 @@
 - 其余参数将原样转发给 `taskiq worker` 子命令（需放在 broker 之前的参数）。
 """
 
-from __future__ import annotations
-
 import subprocess
 import sys
 
@@ -32,4 +30,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

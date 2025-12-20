@@ -1,7 +1,5 @@
 """知识图谱相关工厂方法（Neo4j + LLM 抽取器）。"""
 
-from __future__ import annotations
-
 from functools import lru_cache
 
 from ...core.config import settings

@@ -1,7 +1,5 @@
 """上传接口（去重+入队）集成测试。"""
 
-from __future__ import annotations
-
 import hashlib
 from pathlib import Path
 
@@ -141,4 +139,3 @@ async def test_upload_duplicate_processed_returns_200(repo: SqlAlchemyDocumentRe
     assert body["document"]["document_id"] == document_id
     assert body["document"]["status"] == DocumentStatus.PROCESSED
     assert queue.enqueued_documents == []
-

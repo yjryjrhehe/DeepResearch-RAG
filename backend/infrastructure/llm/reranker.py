@@ -11,8 +11,8 @@ log = logging.getLogger(__name__)
 
 class TEIRerankerClient:
     def __init__(
-        self, 
-        base_url: str, 
+        self,
+        base_url: str,
         api_key: Optional[str] = None,
         timeout: float = 30.0,
         max_concurrency: int = 50
@@ -24,18 +24,18 @@ class TEIRerankerClient:
         self.headers = {"Content-Type": "application/json"}
         if api_key:
             self.headers["Authorization"] = f"Bearer {api_key}"
-        
+
         self.timeout = timeout
         self.max_concurrency = max_concurrency
-            
+
         log.info(f"TEI Reranker 客户端已初始化，目标地址: {self.url}，超时: {self.timeout}s")
 
     # ==================== 1. 单条处理方法 ====================
     async def arerank(
-        self, 
-        query: str, 
-        chunks: List[RetrievedChunk], 
-        top_n: Optional[int] = None, 
+        self,
+        query: str,
+        chunks: List[RetrievedChunk],
+        top_n: Optional[int] = None,
         truncate: bool = True,
         client: Optional[httpx.AsyncClient] = None
     ) -> List[RetrievedChunk]:
@@ -52,8 +52,8 @@ class TEIRerankerClient:
         try:
             async def _send_request(ac: httpx.AsyncClient):
                 return await ac.post(
-                    self.url, 
-                    json=payload, 
+                    self.url,
+                    json=payload,
                     headers=self.headers,
                     timeout=self.timeout
                 )
@@ -63,9 +63,9 @@ class TEIRerankerClient:
             else:
                 async with httpx.AsyncClient() as temp_client:
                     response = await _send_request(temp_client)
-            
+
             response.raise_for_status()
-            
+
             # 2. 处理响应
             return self._process_response(response.json(), chunks, top_n)
 
@@ -82,14 +82,14 @@ class TEIRerankerClient:
     # ==================== 2. 辅助方法 ====================
 
     def _process_response(
-        self, 
-        api_results: List[dict], 
-        original_chunks: List[RetrievedChunk], 
+        self,
+        api_results: List[dict],
+        original_chunks: List[RetrievedChunk],
         top_n: Optional[int]
     ) -> List[RetrievedChunk]:
         """
         处理 API 返回结果，更新 RetrievedChunk 的分数并排序。
-        
+
         :param api_results: TEI API 返回的 JSON 列表 [{'index': 0, 'score': 0.9}, ...]
         :param original_chunks: 原始的 RetrievedChunk 列表
         :return: 更新分数并排序后的 RetrievedChunk 列表
@@ -97,21 +97,21 @@ class TEIRerankerClient:
         # 创建副本以避免修改原始列表的顺序（虽然修改内部对象的属性是引用传递）
         # 建议：如果不想副作用影响外部，应该 deepcopy，但为了性能通常直接修改对象
         processed_chunks = []
-        
+
         try:
             for item in api_results:
                 idx = item['index']
                 score = item['score']
-                
+
                 if 0 <= idx < len(original_chunks):
                     chunk_obj = original_chunks[idx]
-                    # [核心修改] 更新 rerank_score
+                    # 更新 rerank_score
                     chunk_obj.rerank_score = score
                     processed_chunks.append(chunk_obj)
                 else:
                     log.warning(f"API返回的索引 {idx} 超出原始列表范围，已忽略。")
 
-            # [核心修改] 根据 rerank_score 进行降序排序
+            # 根据 rerank_score 进行降序排序
             # 注意：处理可能有部分文档未被 API 返回的情况（虽然少见），未返回的将被丢弃
             processed_chunks.sort(key=lambda x: x.rerank_score if x.rerank_score is not None else -1.0, reverse=True)
 

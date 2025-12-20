@@ -7,8 +7,6 @@ RAG 应用编排服务（图谱 + 向量 + 重排 + 回答）。
 3) 参考 LightRAG 的“回答 + 参考引用”组织方式输出结果。
 """
 
-from __future__ import annotations
-
 import logging
 import asyncio
 import hashlib

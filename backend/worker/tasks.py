@@ -5,8 +5,6 @@
 - 任务函数负责状态流转、异常捕获与错误信息写回，确保可观测性与可重试性。
 """
 
-from __future__ import annotations
-
 import json
 import logging
 

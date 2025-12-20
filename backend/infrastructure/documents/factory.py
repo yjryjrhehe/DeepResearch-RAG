@@ -1,7 +1,5 @@
 """文档仓储工厂方法（SQLAlchemy）。"""
 
-from __future__ import annotations
-
 from functools import lru_cache
 
 from ...domain.documents import DocumentRepository

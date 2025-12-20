@@ -1,7 +1,5 @@
 """数据库 Engine/Session 工厂与初始化逻辑。"""
 
-from __future__ import annotations
-
 import json
 from functools import lru_cache
 from pathlib import Path

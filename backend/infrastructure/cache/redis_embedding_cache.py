@@ -7,8 +7,6 @@ Redis Embedding 缓存实现。
 - 提供简单、可复用的异步接口（domain.EmbeddingCache）。
 """
 
-from __future__ import annotations
-
 import hashlib
 import json
 from typing import Optional, List
@@ -53,4 +51,3 @@ class RedisEmbeddingCache(EmbeddingCache):
     async def set(self, key: str, embedding: List[float], ttl_seconds: int) -> None:
         payload = json.dumps(embedding, ensure_ascii=False, separators=(",", ":"))
         await self._redis.set(name=key, value=payload, ex=ttl_seconds)
-

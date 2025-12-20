@@ -2,7 +2,7 @@
 
 该模块承载 RAG/摄取流程中会跨层传递的数据结构，例如：
 - `DocumentSource`：原始文件来源（路径、文件名、元数据等）
-- `DocumentChunk`：切分后的文档块（供检索入库/知识图谱抽取/引用展示）
+- `DocumentChunk`：切分后的文档块（供检索入库、知识图谱抽取/引用展示）
 - `AnswerResult`：问答结果（回答、引用、证据块与图谱上下文）
 
 类型约束：
@@ -36,7 +36,7 @@ class DocumentSource(BaseModel):
         """自动补全 `document_name`。
 
         Returns:
-            当前对象本身（Pydantic after-validator 约定返回 model）。
+            当前对象自身（Pydantic after-validator 约定返回 model）。
         """
         if self.document_name is None:
             self.document_name = self.file_path.name
@@ -49,6 +49,16 @@ class DocumentChunk(BaseModel):
     说明：
     - 该对象会被用于向量检索入库、知识图谱构建以及问答引用展示。
     - 向量本身不在该模型中传递，由检索仓储实现负责生成与管理。
+
+    Attributes:
+        chunk_id: 文档块唯一 ID。
+        document_id: 所属文档 ID。
+        document_name: 文档原始名称。
+        content: 文档块内容。
+        parent_headings: 父级标题路径（用于检索）。
+        summary: AI 生成摘要（可选）。
+        hypothetical_questions: AI 生成的假设性问题（可选）。
+        metadata: 可扩展元数据（JSON 兼容）。
     """
 
     chunk_id: str = Field(default_factory=lambda: str(uuid.uuid4()), description="文档块唯一 ID")
@@ -84,7 +94,7 @@ class GraphRelation(BaseModel):
 
     source: str = Field(..., description="源实体名称")
     target: str = Field(..., description="目标实体名称")
-    keywords: list[str] = Field(default_factory=list, description="关系关键词")
+    keywords: list[str] = Field(default_factory=list, description="关系关键字")
     description: str = Field(default="", description="关系描述")
     weight: float = Field(default=1.0, description="关系权重（用于筛选/排序）")
 

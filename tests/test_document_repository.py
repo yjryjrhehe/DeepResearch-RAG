@@ -1,7 +1,5 @@
 """文档仓储（SQLite/SQLAlchemy）单元测试。"""
 
-from __future__ import annotations
-
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -124,4 +122,3 @@ async def test_list_retryable_failed(session_factory: async_sessionmaker[AsyncSe
 
     failed_list = await repo.list_retryable_failed(limit=10)
     assert [d.document_id for d in failed_list] == [failed_id]
-

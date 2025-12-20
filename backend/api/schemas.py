@@ -5,8 +5,6 @@
 - 本模块仅包含轻量的 schema，不做业务逻辑。
 """
 
-from __future__ import annotations
-
 from pydantic import BaseModel, Field, JsonValue
 
 from ..domain.documents import DocumentRecord, DocumentStatus
@@ -56,9 +54,11 @@ class QueryRequest(BaseModel):
     )
 
 
-class QueryResponse(AnswerResult):
-    """同步问答响应。"""
+class QueryResponse(BaseModel):
+    """同步问答响应（含任务记录与结果）。"""
 
+    task: QueryTaskRecord = Field(..., description="同步创建并完成的查询任务记录")
+    result: AnswerResult = Field(..., description="问答结果")
     request_id: str | None = Field(default=None, description="请求 ID（可选）")
 
 

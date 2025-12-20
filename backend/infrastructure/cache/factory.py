@@ -1,7 +1,5 @@
 """缓存相关工厂方法（Redis）。"""
 
-from __future__ import annotations
-
 from functools import lru_cache
 from typing import Optional
 
@@ -24,4 +22,3 @@ def get_embedding_cache() -> Optional[EmbeddingCache]:
     if not settings.redis.enabled:
         return None
     return RedisEmbeddingCache(get_redis_client())
-

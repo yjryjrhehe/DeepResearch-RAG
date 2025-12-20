@@ -6,8 +6,6 @@
 2) 或直接执行：`python main.py`
 """
 
-from __future__ import annotations
-
 import uvicorn
 
 
